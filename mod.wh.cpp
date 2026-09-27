@@ -1,9 +1,9 @@
 // ==WindhawkMod==
 // @id              taskbar-mirrored-layout
 // @name            Mirrored Taskbar Layout
-// @description     Mirrors the Windows 10 taskbar layout: on a left/right taskbar the Start button goes to the bottom and the clock to the top
+// @description     Mirrors the Windows taskbar layout: on a left/right taskbar the Start button goes to the bottom and the clock to the top
 // @version         1.0
-// @author          you
+// @author          namyts
 // @include         explorer.exe
 // @architecture    x86
 // @architecture    x86-64
@@ -13,7 +13,7 @@
 /*
 # Mirrored Taskbar Layout
 
-Mirrors the order of the Windows 10 taskbar along its length.
+Mirrors the order of the Windows taskbar.
 
 * Vertical taskbar (left/right): Start at the bottom, clock and notification
   area at the top.
