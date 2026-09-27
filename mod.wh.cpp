@@ -2,293 +2,608 @@
 // @id              taskbar-mirrored-layout
 // @name            Mirrored Taskbar Layout
 // @description     Mirrors the Windows taskbar layout: on a left/right taskbar the Start button goes to the bottom and the clock to the top
-// @version         1.0
+// @version         1.1
 // @author          namyts
 // @include         explorer.exe
 // @architecture    x86
 // @architecture    x86-64
-// @compilerOptions -lgdi32
+// @compilerOptions -lgdi32 -lcomctl32 -loleacc -loleaut32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 # Mirrored Taskbar Layout
 
-Mirrors the order of the Windows taskbar.
+Mirrors the order of the Windows taskbar along its length.
 
-* Vertical taskbar (left/right): Start at the bottom, clock and notification
-  area at the top.
+* Vertical taskbar (left/right): Start at the bottom, apps above it, clock and
+  notification area at the top.
 * Horizontal taskbar (top/bottom): Start on the right, clock and notification
   area on the left.
 
-Only the positions of the taskbar's parts are changed, their contents are drawn
-as usual.
+The taskbar window itself stays where Explorer put it. Only the parts inside
+it are reordered. App buttons are reversed as well, so the first app stays
+next to the Start button.
 */
 // ==/WindhawkModReadme==
 
 #include <windhawk_utils.h>
 
+#include <commctrl.h>
+#include <oleacc.h>
+#include <windowsx.h>
+
 #include <atomic>
+
+constexpr UINT_PTR kTimerId = 0x4D52;
+constexpr UINT_PTR kSubclassId = 0x4D52;
+constexpr DWORD_PTR kPlaceSubclass = 1;
+constexpr DWORD_PTR kTaskListSubclass = 2;
+
+constexpr WCHAR kSeenProp[] = L"WhTaskbarMirror.Seen";
+constexpr WCHAR kOrigXProp[] = L"WhTaskbarMirror.OrigX";
+constexpr WCHAR kOrigYProp[] = L"WhTaskbarMirror.OrigY";
+
+std::atomic<bool> g_enabled;
+std::atomic<int> g_buttonExtent;
+int g_wasVertical = -1;
+bool g_inTaskListPaint = false;
+bool g_inThumbnailMove = false;
 
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t SetWindowPos_Original;
 
-std::atomic<bool> g_enabled;
-
-HWND g_testOverlay;
-
-// A topmost window beside the taskbar. Drawing on the taskbar itself is hidden
-// behind its child windows, so the test has to be a separate window.
-HWND ShowTestOverlay(const RECT& taskbarRect) {
-    static bool registered = false;
-    const HINSTANCE instance = GetModuleHandle(nullptr);
-    if (!registered) {
-        WNDCLASS wc{};
-        wc.lpfnWndProc = DefWindowProcW;
-        wc.hInstance = instance;
-        wc.hbrBackground = CreateSolidBrush(RGB(255, 0, 128));
-        wc.lpszClassName = L"WhTaskbarMirrorTest";
-        RegisterClass(&wc);
-        registered = true;
-    }
-
-    RECT rc = taskbarRect;
-    int width = rc.right - rc.left;
-    int height = rc.bottom - rc.top;
-    int x = rc.left;
-    int y = rc.top;
-    int w = 200;
-    int h = 200;
-
-    if (width <= 0 || height <= 0) {
-        x = 80;
-        y = 80;
-    } else if (height > width) {
-        h = height;
-        x = (rc.left <= 2) ? rc.right : rc.left - w;
-    } else {
-        w = width;
-        y = (rc.top <= 2) ? rc.bottom : rc.top - h;
-    }
-
-    return CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                           L"WhTaskbarMirrorTest", L"MIRROR TEST",
-                           WS_POPUP | WS_VISIBLE, x, y, w, h, nullptr, nullptr,
-                           instance, nullptr);
+bool ClassIs(HWND hwnd, const WCHAR* name) {
+    WCHAR cls[64];
+    return GetClassName(hwnd, cls, ARRAYSIZE(cls)) && _wcsicmp(cls, name) == 0;
 }
 
-RECT GetRectInParent(HWND hWnd, HWND parent);
-
-void AppendLine(WCHAR* buf, size_t cap, const WCHAR* line) {
-    size_t len = wcslen(buf);
-    if (len >= cap) {
-        return;
-    }
-    _snwprintf_s(buf + len, cap - len, _TRUNCATE, L"%s\n", line);
+bool IsTaskbarWnd(HWND hwnd) {
+    return ClassIs(hwnd, L"Shell_TrayWnd") ||
+           ClassIs(hwnd, L"Shell_SecondaryTrayWnd");
 }
 
-void DumpWindows(WCHAR* buf, size_t cap, HWND parent, int depth) {
-    if (depth > 2) {
-        return;
-    }
-
-    int count = 0;
-    for (HWND child = GetWindow(parent, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        if (++count > 25 || wcslen(buf) + 180 >= cap) {
-            AppendLine(buf, cap, L"  ...");
-            return;
-        }
-
-        WCHAR cls[64]{};
-        GetClassName(child, cls, ARRAYSIZE(cls));
-        RECT rect = GetRectInParent(child, parent);
-
-        WCHAR line[180];
-        _snwprintf_s(line, _TRUNCATE, L"%s%s %p  %d,%d %dx%d",
-                     depth == 0 ? L"" : (depth == 1 ? L"  " : L"    "), cls,
-                     child, rect.left, rect.top, rect.right - rect.left,
-                     rect.bottom - rect.top);
-        AppendLine(buf, cap, line);
-        DumpWindows(buf, cap, child, depth + 1);
-    }
-}
-
-bool IsTaskbarWnd(HWND hWnd) {
-    WCHAR className[32];
-    return GetClassName(hWnd, className, ARRAYSIZE(className)) &&
-           (_wcsicmp(className, L"Shell_TrayWnd") == 0 ||
-            _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0);
-}
-
-bool IsTrayNotifyWnd(HWND hWnd) {
-    WCHAR className[32];
-    return GetClassName(hWnd, className, ARRAYSIZE(className)) &&
-           _wcsicmp(className, L"TrayNotifyWnd") == 0 &&
-           IsTaskbarWnd(GetAncestor(hWnd, GA_PARENT));
-}
-
-// The parent within which the window's position is mirrored, or null if the
-// window isn't one of the mirrored taskbar parts.
-HWND GetMirrorParent(HWND hWnd) {
-    HWND parent = GetAncestor(hWnd, GA_PARENT);
-    if (parent && (IsTaskbarWnd(parent) || IsTrayNotifyWnd(parent))) {
-        return parent;
-    }
-
-    return nullptr;
-}
-
-// Mirrors a rect given in the parent's client coordinates along the taskbar's
-// long axis. Applying it twice gives back the original rect.
-void MirrorRect(HWND parent, int& x, int& y, int cx, int cy) {
-    HWND taskbar = IsTaskbarWnd(parent) ? parent : GetAncestor(parent, GA_PARENT);
-
-    RECT taskbarRect;
-    RECT parentRect;
-    if (!GetWindowRect(taskbar, &taskbarRect) ||
-        !GetClientRect(parent, &parentRect)) {
-        return;
-    }
-
-    if (taskbarRect.bottom - taskbarRect.top >
-        taskbarRect.right - taskbarRect.left) {
-        y = parentRect.bottom - y - cy;
-    } else {
-        x = parentRect.right - x - cx;
-    }
-}
-
-RECT GetRectInParent(HWND hWnd, HWND parent) {
+RECT GetRectInParent(HWND hwnd, HWND parent) {
     RECT rect{};
-    GetWindowRect(hWnd, &rect);
+    GetWindowRect(hwnd, &rect);
     MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
     return rect;
 }
 
-void MirrorWindowPos(HWND hWnd, int& x, int& y, int& cx, int& cy, UINT& flags) {
-    if (!g_enabled || ((flags & SWP_NOMOVE) && (flags & SWP_NOSIZE))) {
+bool IsVerticalTaskbar(HWND taskbar) {
+    RECT client{};
+    GetClientRect(taskbar, &client);
+    return client.bottom - client.top > client.right - client.left;
+}
+
+// The composition background and the off-screen core window fill the taskbar
+// but are not buttons. Moving them makes Explorer undo the whole layout.
+bool IsIgnored(HWND hwnd, HWND parent) {
+    if (ClassIs(hwnd, L"Windows.UI.Composition.DesktopWindowContentBridge") ||
+        ClassIs(hwnd, L"Windows.UI.Core.CoreWindow") ||
+        ClassIs(hwnd, L"Windows.UI.Input.InputSite.WindowClass")) {
+        return true;
+    }
+
+    RECT rect = GetRectInParent(hwnd, parent);
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    if (width <= 0 || height <= 0 || rect.left < -100 || rect.top < -100) {
+        return true;
+    }
+
+    RECT client{};
+    GetClientRect(parent, &client);
+    if (width > client.right * 3 / 2 || height > client.bottom * 3 / 2) {
+        return true;
+    }
+    if (width >= client.right - 2 && height >= client.bottom - 2) {
+        return true;
+    }
+    return false;
+}
+
+bool IsTray(HWND hwnd) {
+    return ClassIs(hwnd, L"TrayNotifyWnd");
+}
+
+bool IsRebar(HWND hwnd) {
+    return ClassIs(hwnd, L"ReBarWindow32");
+}
+
+bool IsEndDock(HWND hwnd, HWND parent) {
+    return !IsIgnored(hwnd, parent) && !IsTray(hwnd) && !IsRebar(hwnd);
+}
+
+void RememberOriginal(HWND hwnd, HWND parent) {
+    if (GetProp(hwnd, kSeenProp)) {
         return;
     }
 
-    HWND parent = GetMirrorParent(hWnd);
-    if (!parent) {
-        return;
+    RECT rect = GetRectInParent(hwnd, parent);
+    SetProp(hwnd, kSeenProp, (HANDLE)1);
+    SetProp(hwnd, kOrigXProp, (HANDLE)(LONG_PTR)rect.left);
+    SetProp(hwnd, kOrigYProp, (HANDLE)(LONG_PTR)rect.top);
+}
+
+int OrigAxis(HWND hwnd, HWND parent, bool vertical) {
+    if (GetProp(hwnd, kSeenProp)) {
+        return (int)(LONG_PTR)GetProp(hwnd, vertical ? kOrigYProp : kOrigXProp);
     }
 
-    // A mirrored position depends on the size, so a resize has to move the
-    // window too, and a move needs the current size.
-    if (flags & (SWP_NOMOVE | SWP_NOSIZE)) {
-        RECT rect = GetRectInParent(hWnd, parent);
-        int currentCx = rect.right - rect.left;
-        int currentCy = rect.bottom - rect.top;
-
-        if (flags & SWP_NOMOVE) {
-            x = rect.left;
-            y = rect.top;
-            MirrorRect(parent, x, y, currentCx, currentCy);
-            flags &= ~SWP_NOMOVE;
-        }
-
-        if (flags & SWP_NOSIZE) {
-            cx = currentCx;
-            cy = currentCy;
-        }
-    }
-
-    MirrorRect(parent, x, y, cx, cy);
+    RECT rect = GetRectInParent(hwnd, parent);
+    return vertical ? rect.top : rect.left;
 }
 
-BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
-                              HWND hWndInsertAfter,
-                              int X,
-                              int Y,
-                              int cx,
-                              int cy,
-                              UINT uFlags) {
-    MirrorWindowPos(hWnd, X, Y, cx, cy, uFlags);
-    return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+int ChildExtent(HWND hwnd, HWND parent, bool vertical) {
+    RECT rect = GetRectInParent(hwnd, parent);
+    return vertical ? rect.bottom - rect.top : rect.right - rect.left;
 }
 
-using DeferWindowPos_t = decltype(&DeferWindowPos);
-DeferWindowPos_t DeferWindowPos_Original;
-HDWP WINAPI DeferWindowPos_Hook(HDWP hWinPosInfo,
-                                HWND hWnd,
-                                HWND hWndInsertAfter,
-                                int x,
-                                int y,
-                                int cx,
-                                int cy,
-                                UINT uFlags) {
-    MirrorWindowPos(hWnd, x, y, cx, cy, uFlags);
-    return DeferWindowPos_Original(hWinPosInfo, hWnd, hWndInsertAfter, x, y,
-                                   cx, cy, uFlags);
-}
-
-using MoveWindow_t = decltype(&MoveWindow);
-MoveWindow_t MoveWindow_Original;
-BOOL WINAPI MoveWindow_Hook(HWND hWnd,
-                            int X,
-                            int Y,
-                            int nWidth,
-                            int nHeight,
-                            BOOL bRepaint) {
-    UINT flags = 0;
-    MirrorWindowPos(hWnd, X, Y, nWidth, nHeight, flags);
-    return MoveWindow_Original(hWnd, X, Y, nWidth, nHeight, bRepaint);
-}
-
-// Flips the parts which are already laid out, used when the mod is turned on
-// and off. Since mirroring twice is a no-op, the same pass does both.
-void MirrorChildren(HWND parent) {
+// Distance from the far end to the far side of this window: its own size plus
+// every end-docked sibling that Explorer originally placed before it. The
+// window Explorer put nearest the start edge (Start) therefore lands nearest
+// the far edge.
+int EndDockPrefix(HWND hwnd, HWND parent, bool vertical) {
+    int mine = OrigAxis(hwnd, parent, vertical);
+    int sum = 0;
     for (HWND child = GetWindow(parent, GW_CHILD); child;
          child = GetWindow(child, GW_HWNDNEXT)) {
-        RECT rect = GetRectInParent(child, parent);
-        int x = rect.left;
-        int y = rect.top;
-        MirrorRect(parent, x, y, rect.right - rect.left, rect.bottom - rect.top);
-        SetWindowPos_Original(child, nullptr, x, y, 0, 0,
-                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-
-        if (IsTrayNotifyWnd(child)) {
-            MirrorChildren(child);
+        if (!IsEndDock(child, parent)) {
+            continue;
+        }
+        int extent = ChildExtent(child, parent, vertical);
+        if (extent <= 0) {
+            continue;
+        }
+        int orig = OrigAxis(child, parent, vertical);
+        if (orig < mine || child == hwnd) {
+            sum += extent;
         }
     }
+    return sum;
 }
 
-BOOL CALLBACK MirrorAllTaskbarsEnum(HWND hWnd, LPARAM) {
-    DWORD processId;
-    if (GetWindowThreadProcessId(hWnd, &processId) &&
-        processId == GetCurrentProcessId() && IsTaskbarWnd(hWnd)) {
-        MirrorChildren(hWnd);
+int EndDockTotal(HWND parent, bool vertical) {
+    int sum = 0;
+    for (HWND child = GetWindow(parent, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (IsEndDock(child, parent)) {
+            int extent = ChildExtent(child, parent, vertical);
+            if (extent > 0) {
+                sum += extent;
+            }
+        }
+    }
+    return sum;
+}
+
+bool TargetPos(HWND hwnd, HWND parent, int cx, int cy, int& x, int& y) {
+    RECT client{};
+    GetClientRect(parent, &client);
+    bool vertical = client.bottom > client.right;
+    int limit = vertical ? client.bottom : client.right;
+    int extent = vertical ? cy : cx;
+    if (extent <= 0 || limit <= 0) {
+        return false;
+    }
+
+    int pos = 0;
+    if (IsTray(hwnd)) {
+        pos = 0;
+    } else if (IsRebar(hwnd)) {
+        pos = limit - EndDockTotal(parent, vertical) - extent;
+    } else if (IsEndDock(hwnd, parent)) {
+        pos = limit - EndDockPrefix(hwnd, parent, vertical);
+    } else {
+        return false;
+    }
+    if (pos < 0) {
+        pos = 0;
+    }
+
+    if (vertical) {
+        y = pos;
+    } else {
+        x = pos;
+    }
+    return true;
+}
+
+void RewritePlacement(HWND hwnd, WINDOWPOS* wp) {
+    HWND parent = GetParent(hwnd);
+    if (!parent || !IsTaskbarWnd(parent)) {
+        return;
+    }
+
+    RECT now = GetRectInParent(hwnd, parent);
+    int cx = (wp->flags & SWP_NOSIZE) ? now.right - now.left : wp->cx;
+    int cy = (wp->flags & SWP_NOSIZE) ? now.bottom - now.top : wp->cy;
+    if ((wp->flags & SWP_NOMOVE) && (wp->flags & SWP_NOSIZE)) {
+        return;
+    }
+
+    int x = (wp->flags & SWP_NOMOVE) ? now.left : wp->x;
+    int y = (wp->flags & SWP_NOMOVE) ? now.top : wp->y;
+    if (!TargetPos(hwnd, parent, cx, cy, x, y)) {
+        return;
+    }
+
+    wp->x = x;
+    wp->y = y;
+    wp->flags &= ~SWP_NOMOVE;
+}
+
+HWND FindTaskList(HWND taskbar) {
+    HWND rebar = FindWindowExW(taskbar, nullptr, L"ReBarWindow32", nullptr);
+    HWND taskSwitch =
+        rebar ? FindWindowExW(rebar, nullptr, L"MSTaskSwWClass", nullptr)
+              : nullptr;
+    return taskSwitch
+               ? FindWindowExW(taskSwitch, nullptr, L"MSTaskListWClass", nullptr)
+               : nullptr;
+}
+
+int MapExtent(int pos, int total) {
+    int button = g_buttonExtent.load();
+    if (button <= 0) {
+        return pos;
+    }
+
+    int count = total / button;
+    int used = count * button;
+    if (count < 2 || pos < 0 || pos >= used) {
+        return pos;
+    }
+
+    int strip = pos / button;
+    int offset = pos % button;
+    return (count - 1 - strip) * button + offset;
+}
+
+POINT MapClientPoint(HWND taskList, POINT pt) {
+    RECT client{};
+    GetClientRect(taskList, &client);
+    HWND taskbar = GetAncestor(taskList, GA_ROOT);
+    if (IsVerticalTaskbar(taskbar)) {
+        pt.y = MapExtent(pt.y, client.bottom);
+    } else {
+        pt.x = MapExtent(pt.x, client.right);
+    }
+    return pt;
+}
+
+void ReverseStrips(HWND taskList) {
+    int button = g_buttonExtent.load();
+    if (button <= 0) {
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(taskList, &client);
+    HWND taskbar = GetAncestor(taskList, GA_ROOT);
+    bool vertical = IsVerticalTaskbar(taskbar);
+    int total = vertical ? client.bottom : client.right;
+    int cross = vertical ? client.right : client.bottom;
+    int count = total / button;
+    if (count < 2 || cross <= 0) {
+        return;
+    }
+
+    HDC hdc = GetDC(taskList);
+    if (!hdc) {
+        return;
+    }
+
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP bitmap = CreateCompatibleBitmap(hdc, vertical ? cross : button,
+                                            vertical ? button : cross);
+    HGDIOBJ previous = SelectObject(mem, bitmap);
+
+    for (int i = 0; i < count / 2; i++) {
+        int a = i * button;
+        int b = (count - 1 - i) * button;
+        if (vertical) {
+            BitBlt(mem, 0, 0, cross, button, hdc, 0, a, SRCCOPY);
+            BitBlt(hdc, 0, a, cross, button, hdc, 0, b, SRCCOPY);
+            BitBlt(hdc, 0, b, cross, button, mem, 0, 0, SRCCOPY);
+        } else {
+            BitBlt(mem, 0, 0, button, cross, hdc, a, 0, SRCCOPY);
+            BitBlt(hdc, a, 0, button, cross, hdc, b, 0, SRCCOPY);
+            BitBlt(hdc, b, 0, button, cross, mem, 0, 0, SRCCOPY);
+        }
+    }
+
+    SelectObject(mem, previous);
+    DeleteObject(bitmap);
+    DeleteDC(mem);
+    ReleaseDC(taskList, hdc);
+}
+
+bool RemapMouse(HWND taskList, UINT msg, LPARAM& lParam) {
+    bool screen = false;
+    switch (msg) {
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+        case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+        case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN:
+        case WM_XBUTTONUP:
+        case WM_XBUTTONDBLCLK:
+            break;
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+        case WM_CONTEXTMENU:
+        case WM_NCHITTEST:
+            screen = true;
+            break;
+        default:
+            return false;
+    }
+
+    POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    if (screen) {
+        ScreenToClient(taskList, &pt);
+    }
+    pt = MapClientPoint(taskList, pt);
+    if (screen) {
+        ClientToScreen(taskList, &pt);
+    }
+    lParam = MAKELPARAM((SHORT)pt.x, (SHORT)pt.y);
+    return true;
+}
+
+LRESULT CALLBACK MirrorSubclassProc(HWND hwnd,
+                                    UINT msg,
+                                    WPARAM wParam,
+                                    LPARAM lParam,
+                                    UINT_PTR id,
+                                    DWORD_PTR ref) {
+    if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, MirrorSubclassProc, id);
+        return DefSubclassProc(hwnd, msg, wParam, lParam);
+    }
+
+    if (!g_enabled) {
+        return DefSubclassProc(hwnd, msg, wParam, lParam);
+    }
+
+    if (ref == kTaskListSubclass) {
+        if (msg == WM_PAINT && !g_inTaskListPaint) {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            InvalidateRect(hwnd, &client, FALSE);
+
+            g_inTaskListPaint = true;
+            LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+            g_inTaskListPaint = false;
+
+            ReverseStrips(hwnd);
+            return result;
+        }
+
+        RemapMouse(hwnd, msg, lParam);
+        return DefSubclassProc(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_WINDOWPOSCHANGING) {
+        RewritePlacement(hwnd, reinterpret_cast<WINDOWPOS*>(lParam));
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+void PlaceWindow(HWND hwnd, HWND parent) {
+    RECT now = GetRectInParent(hwnd, parent);
+    int x = now.left;
+    int y = now.top;
+    int cx = now.right - now.left;
+    int cy = now.bottom - now.top;
+    if (!TargetPos(hwnd, parent, cx, cy, x, y)) {
+        return;
+    }
+    if (x == now.left && y == now.top) {
+        return;
+    }
+
+    Wh_Log(L"Move %p -> %d,%d", hwnd, x, y);
+    SetWindowPos(hwnd, nullptr, x, y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+int MeasureButtonExtent(HWND taskList, bool vertical) {
+    DWORD toolbar = (DWORD)SendMessage(taskList, TB_GETBUTTONSIZE, 0, 0);
+    int fromToolbar = vertical ? HIWORD(toolbar) : LOWORD(toolbar);
+    if (fromToolbar >= 24 && fromToolbar <= 96) {
+        return fromToolbar;
+    }
+
+    static const GUID kIID_IAccessible = {
+        0x618736e0,
+        0x3c3d,
+        0x11cf,
+        {0x81, 0x0c, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
+    IAccessible* accessible = nullptr;
+    if (FAILED(AccessibleObjectFromWindow(
+            taskList, OBJID_CLIENT, kIID_IAccessible,
+            reinterpret_cast<void**>(&accessible))) ||
+        !accessible) {
+        return 0;
+    }
+
+    long count = 0;
+    accessible->get_accChildCount(&count);
+    int extent = 0;
+    for (long i = 1; i <= count && i <= 8; i++) {
+        VARIANT child;
+        VariantInit(&child);
+        child.vt = VT_I4;
+        child.lVal = i;
+
+        long x = 0;
+        long y = 0;
+        long width = 0;
+        long height = 0;
+        if (SUCCEEDED(accessible->accLocation(&x, &y, &width, &height, child))) {
+            int candidate = vertical ? height : width;
+            if (candidate >= 24 && candidate <= 96) {
+                extent = candidate;
+                VariantClear(&child);
+                break;
+            }
+        }
+        VariantClear(&child);
+    }
+
+    accessible->Release();
+    return extent;
+}
+
+void EnsureTaskbar(HWND taskbar) {
+    bool vertical = IsVerticalTaskbar(taskbar);
+    if (g_wasVertical != (int)vertical) {
+        if (g_wasVertical != -1) {
+            for (HWND child = GetWindow(taskbar, GW_CHILD); child;
+                 child = GetWindow(child, GW_HWNDNEXT)) {
+                RemoveProp(child, kSeenProp);
+                RemoveProp(child, kOrigXProp);
+                RemoveProp(child, kOrigYProp);
+            }
+        }
+        g_wasVertical = (int)vertical;
+    }
+
+    for (HWND child = GetWindow(taskbar, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (IsIgnored(child, taskbar)) {
+            continue;
+        }
+        if (!IsTray(child) && !IsRebar(child) && !IsEndDock(child, taskbar)) {
+            continue;
+        }
+
+        RememberOriginal(child, taskbar);
+        SetWindowSubclass(child, MirrorSubclassProc, kSubclassId, kPlaceSubclass);
+    }
+
+    for (HWND child = GetWindow(taskbar, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (!IsIgnored(child, taskbar) &&
+            (IsTray(child) || IsRebar(child) || IsEndDock(child, taskbar))) {
+            PlaceWindow(child, taskbar);
+        }
+    }
+
+    HWND taskList = FindTaskList(taskbar);
+    if (!taskList) {
+        return;
+    }
+
+    SetWindowSubclass(taskList, MirrorSubclassProc, kSubclassId,
+                      kTaskListSubclass);
+
+    int extent = MeasureButtonExtent(taskList, vertical);
+    if (extent > 0 && extent != g_buttonExtent.load()) {
+        g_buttonExtent = extent;
+        Wh_Log(L"Button extent %d", extent);
+        InvalidateRect(taskList, nullptr, TRUE);
+    }
+}
+
+void RestoreTaskbar(HWND taskbar) {
+    KillTimer(taskbar, kTimerId);
+
+    HWND taskList = FindTaskList(taskbar);
+    if (taskList) {
+        RemoveWindowSubclass(taskList, MirrorSubclassProc, kSubclassId);
+    }
+
+    for (HWND child = GetWindow(taskbar, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (!GetProp(child, kSeenProp)) {
+            continue;
+        }
+
+        int x = (int)(LONG_PTR)GetProp(child, kOrigXProp);
+        int y = (int)(LONG_PTR)GetProp(child, kOrigYProp);
+        RemoveWindowSubclass(child, MirrorSubclassProc, kSubclassId);
+        RemoveProp(child, kSeenProp);
+        RemoveProp(child, kOrigXProp);
+        RemoveProp(child, kOrigYProp);
+        SetWindowPos(child, nullptr, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    if (taskList) {
+        InvalidateRect(taskList, nullptr, TRUE);
+    }
+}
+
+void CALLBACK EnforceTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
+    if (!g_enabled || !IsTaskbarWnd(hwnd)) {
+        KillTimer(hwnd, kTimerId);
+        return;
+    }
+    EnsureTaskbar(hwnd);
+}
+
+BOOL CALLBACK TaskbarEnumProc(HWND hwnd, LPARAM lParam) {
+    DWORD processId = 0;
+    bool enable = lParam != 0;
+    if (!GetWindowThreadProcessId(hwnd, &processId) ||
+        processId != GetCurrentProcessId() || !IsTaskbarWnd(hwnd)) {
+        return TRUE;
+    }
+
+    if (enable) {
+        SetTimer(hwnd, kTimerId, 400, EnforceTimerProc);
+        EnsureTaskbar(hwnd);
+    } else {
+        RestoreTaskbar(hwnd);
     }
     return TRUE;
 }
 
-void MirrorAllTaskbars() {
-    EnumWindows(MirrorAllTaskbarsEnum, 0);
+void ApplyAll(bool enable) {
+    EnumWindows(TaskbarEnumProc, enable ? 1 : 0);
 }
 
-BOOL CALLBACK FindTaskbarEnum(HWND hWnd, LPARAM lParam) {
-    DWORD processId;
-    WCHAR className[32];
-    if (GetWindowThreadProcessId(hWnd, &processId) &&
-        processId == GetCurrentProcessId() &&
-        GetClassName(hWnd, className, ARRAYSIZE(className)) &&
-        _wcsicmp(className, L"Shell_TrayWnd") == 0) {
-        *reinterpret_cast<HWND*>(lParam) = hWnd;
-        return FALSE;
+BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
+                              HWND insertAfter,
+                              int x,
+                              int y,
+                              int cx,
+                              int cy,
+                              UINT flags) {
+    if (g_enabled && !g_inThumbnailMove && !(flags & SWP_NOMOVE) &&
+        ClassIs(hwnd, L"TaskListThumbnailWnd") && g_buttonExtent.load() > 0) {
+        HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        HWND taskList = taskbar ? FindTaskList(taskbar) : nullptr;
+        if (taskList) {
+            POINT anchor{x + cx / 2, y + cy / 2};
+            POINT mapped = anchor;
+            ScreenToClient(taskList, &mapped);
+            mapped = MapClientPoint(taskList, mapped);
+            ClientToScreen(taskList, &mapped);
+            x += mapped.x - anchor.x;
+            y += mapped.y - anchor.y;
+        }
     }
-    return TRUE;
+
+    g_inThumbnailMove = true;
+    BOOL result =
+        SetWindowPos_Original(hwnd, insertAfter, x, y, cx, cy, flags);
+    g_inThumbnailMove = false;
+    return result;
 }
 
-HWND FindCurrentProcessTaskbarWnd() {
-    HWND hTaskbarWnd = nullptr;
-    EnumWindows(FindTaskbarEnum, reinterpret_cast<LPARAM>(&hTaskbarWnd));
-    return hTaskbarWnd;
-}
-
-using RunFromWindowThreadProc_t = void (*)(PVOID parameter);
+using RunFromWindowThreadProc_t = void (*)(PVOID);
 
 struct RunFromWindowThreadParam {
     RunFromWindowThreadProc_t proc;
@@ -297,147 +612,76 @@ struct RunFromWindowThreadParam {
 
 UINT g_runFromWindowThreadMsg;
 
-LRESULT CALLBACK RunFromWindowThreadHook(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION) {
-        const CWPSTRUCT* cwp = (const CWPSTRUCT*)lParam;
-        if (cwp->message == g_runFromWindowThreadMsg) {
-            auto* param = (RunFromWindowThreadParam*)cwp->lParam;
+LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        const CWPSTRUCT* msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
+        if (msg->message == g_runFromWindowThreadMsg) {
+            auto* param = reinterpret_cast<RunFromWindowThreadParam*>(msg->lParam);
             param->proc(param->procParam);
         }
     }
-
-    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+    return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-bool RunFromWindowThread(HWND hWnd,
-                         RunFromWindowThreadProc_t proc,
-                         PVOID procParam) {
+bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc_t proc, PVOID param) {
     if (!g_runFromWindowThreadMsg) {
         g_runFromWindowThreadMsg =
             RegisterWindowMessage(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
     }
 
-    DWORD dwThreadId = GetWindowThreadProcessId(hWnd, nullptr);
-    if (dwThreadId == 0) {
+    DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
+    if (!threadId) {
         return false;
     }
-
-    if (dwThreadId == GetCurrentThreadId()) {
-        proc(procParam);
+    if (threadId == GetCurrentThreadId()) {
+        proc(param);
         return true;
     }
 
-    HHOOK hook = SetWindowsHookEx(WH_CALLWNDPROC, RunFromWindowThreadHook,
-                                  nullptr, dwThreadId);
+    HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROC, RunFromWindowThreadHook,
+                                   nullptr, threadId);
     if (!hook) {
         return false;
     }
 
-    RunFromWindowThreadParam param;
-    param.proc = proc;
-    param.procParam = procParam;
-    SendMessage(hWnd, g_runFromWindowThreadMsg, 0, (LPARAM)&param);
-
+    RunFromWindowThreadParam data{proc, param};
+    SendMessage(hwnd, g_runFromWindowThreadMsg, 0, (LPARAM)&data);
     UnhookWindowsHookEx(hook);
-
     return true;
 }
 
-// Runs on the taskbar thread, so that the taskbar can't lay itself out halfway
-// through the switch.
-void SetEnabled(bool enabled) {
-    struct PARAM {
-        bool enabled;
-    } param{enabled};
+void SetEnabled(bool enable) {
+    g_enabled = enable;
 
-    auto proc = [](PVOID p) {
-        g_enabled = static_cast<PARAM*>(p)->enabled;
-        MirrorAllTaskbars();
-    };
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    DWORD processId = 0;
+    if (!taskbar || !GetWindowThreadProcessId(taskbar, &processId) ||
+        processId != GetCurrentProcessId()) {
+        return;
+    }
 
-    HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
-    if (!hTaskbarWnd || !RunFromWindowThread(hTaskbarWnd, proc, &param)) {
-        g_enabled = enabled;
+    auto proc = [](PVOID p) { ApplyAll(*static_cast<bool*>(p)); };
+    if (!RunFromWindowThread(taskbar, proc, &enable)) {
+        ApplyAll(enable);
     }
 }
 
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
-    WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
-                                   &SetWindowPos_Original);
-    WindhawkUtils::SetFunctionHook(DeferWindowPos, DeferWindowPos_Hook,
-                                   &DeferWindowPos_Original);
-    WindhawkUtils::SetFunctionHook(MoveWindow, MoveWindow_Hook,
-                                   &MoveWindow_Original);
-
+    if (!WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
+                                        &SetWindowPos_Original)) {
+        Wh_Log(L"SetWindowPos hook failed");
+    }
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
     Wh_Log(L">");
-
-    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-    DWORD taskbarPid = 0;
-    if (taskbar) {
-        GetWindowThreadProcessId(taskbar, &taskbarPid);
-    }
-
-    RECT rect{};
-    if (taskbar) {
-        GetWindowRect(taskbar, &rect);
-    }
-
-    // Ask the shell to nudge the taskbar, then see if the rect actually changed.
-    RECT nudged = rect;
-    BOOL nudgeOk = FALSE;
-    if (taskbar) {
-        nudgeOk = SetWindowPos(taskbar, nullptr, rect.left + 120, rect.top, 0, 0,
-                               SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        GetWindowRect(taskbar, &nudged);
-        SetWindowPos(taskbar, nullptr, rect.left, rect.top, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-
-    g_testOverlay = ShowTestOverlay(rect);
-
-    WCHAR message[4096]{};
-    WCHAR line[256];
-    AppendLine(message, ARRAYSIZE(message),
-               L"Press Ctrl+C to copy this whole text.");
-    _snwprintf_s(line, _TRUNCATE, L"Our pid: %lu", GetCurrentProcessId());
-    AppendLine(message, ARRAYSIZE(message), line);
-    _snwprintf_s(line, _TRUNCATE, L"Shell_TrayWnd: %p  pid %lu", taskbar,
-                 taskbarPid);
-    AppendLine(message, ARRAYSIZE(message), line);
-    _snwprintf_s(line, _TRUNCATE, L"Rect: %d,%d %dx%d", rect.left, rect.top,
-                 rect.right - rect.left, rect.bottom - rect.top);
-    AppendLine(message, ARRAYSIZE(message), line);
-    _snwprintf_s(line, _TRUNCATE, L"Nudge returned %d, rect became %d,%d",
-                 nudgeOk, nudged.left, nudged.top);
-    AppendLine(message, ARRAYSIZE(message), line);
-    _snwprintf_s(line, _TRUNCATE, L"Pink overlay: %p", g_testOverlay);
-    AppendLine(message, ARRAYSIZE(message), line);
-    AppendLine(message, ARRAYSIZE(message), L"Children:");
-    if (taskbar) {
-        DumpWindows(message, ARRAYSIZE(message), taskbar, 0);
-    } else {
-        AppendLine(message, ARRAYSIZE(message), L"(no taskbar window)");
-    }
-
-    MessageBoxW(nullptr, message, L"Taskbar mirror test",
-                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
-
-    if (g_testOverlay) {
-        DestroyWindow(g_testOverlay);
-        g_testOverlay = nullptr;
-    }
-
     SetEnabled(true);
 }
 
 void Wh_ModUninit() {
     Wh_Log(L">");
-
     SetEnabled(false);
 }
