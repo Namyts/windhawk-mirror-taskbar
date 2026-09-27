@@ -7,6 +7,7 @@
 // @include         explorer.exe
 // @architecture    x86
 // @architecture    x86-64
+// @compilerOptions -lgdi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -29,7 +30,89 @@ as usual.
 
 #include <atomic>
 
+using SetWindowPos_t = decltype(&SetWindowPos);
+SetWindowPos_t SetWindowPos_Original;
+
 std::atomic<bool> g_enabled;
+
+HWND g_testOverlay;
+
+// A topmost window beside the taskbar. Drawing on the taskbar itself is hidden
+// behind its child windows, so the test has to be a separate window.
+HWND ShowTestOverlay(const RECT& taskbarRect) {
+    static bool registered = false;
+    const HINSTANCE instance = GetModuleHandle(nullptr);
+    if (!registered) {
+        WNDCLASS wc{};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = instance;
+        wc.hbrBackground = CreateSolidBrush(RGB(255, 0, 128));
+        wc.lpszClassName = L"WhTaskbarMirrorTest";
+        RegisterClass(&wc);
+        registered = true;
+    }
+
+    RECT rc = taskbarRect;
+    int width = rc.right - rc.left;
+    int height = rc.bottom - rc.top;
+    int x = rc.left;
+    int y = rc.top;
+    int w = 200;
+    int h = 200;
+
+    if (width <= 0 || height <= 0) {
+        x = 80;
+        y = 80;
+    } else if (height > width) {
+        h = height;
+        x = (rc.left <= 2) ? rc.right : rc.left - w;
+    } else {
+        w = width;
+        y = (rc.top <= 2) ? rc.bottom : rc.top - h;
+    }
+
+    return CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                           L"WhTaskbarMirrorTest", L"MIRROR TEST",
+                           WS_POPUP | WS_VISIBLE, x, y, w, h, nullptr, nullptr,
+                           instance, nullptr);
+}
+
+RECT GetRectInParent(HWND hWnd, HWND parent);
+
+void AppendLine(WCHAR* buf, size_t cap, const WCHAR* line) {
+    size_t len = wcslen(buf);
+    if (len >= cap) {
+        return;
+    }
+    _snwprintf_s(buf + len, cap - len, _TRUNCATE, L"%s\n", line);
+}
+
+void DumpWindows(WCHAR* buf, size_t cap, HWND parent, int depth) {
+    if (depth > 2) {
+        return;
+    }
+
+    int count = 0;
+    for (HWND child = GetWindow(parent, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (++count > 25 || wcslen(buf) + 180 >= cap) {
+            AppendLine(buf, cap, L"  ...");
+            return;
+        }
+
+        WCHAR cls[64]{};
+        GetClassName(child, cls, ARRAYSIZE(cls));
+        RECT rect = GetRectInParent(child, parent);
+
+        WCHAR line[180];
+        _snwprintf_s(line, _TRUNCATE, L"%s%s %p  %d,%d %dx%d",
+                     depth == 0 ? L"" : (depth == 1 ? L"  " : L"    "), cls,
+                     child, rect.left, rect.top, rect.right - rect.left,
+                     rect.bottom - rect.top);
+        AppendLine(buf, cap, line);
+        DumpWindows(buf, cap, child, depth + 1);
+    }
+}
 
 bool IsTaskbarWnd(HWND hWnd) {
     WCHAR className[32];
@@ -116,8 +199,6 @@ void MirrorWindowPos(HWND hWnd, int& x, int& y, int& cx, int& cy, UINT& flags) {
     MirrorRect(parent, x, y, cx, cy);
 }
 
-using SetWindowPos_t = decltype(&SetWindowPos);
-SetWindowPos_t SetWindowPos_Original;
 BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
                               HWND hWndInsertAfter,
                               int X,
@@ -295,6 +376,62 @@ BOOL Wh_ModInit() {
 
 void Wh_ModAfterInit() {
     Wh_Log(L">");
+
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    DWORD taskbarPid = 0;
+    if (taskbar) {
+        GetWindowThreadProcessId(taskbar, &taskbarPid);
+    }
+
+    RECT rect{};
+    if (taskbar) {
+        GetWindowRect(taskbar, &rect);
+    }
+
+    // Ask the shell to nudge the taskbar, then see if the rect actually changed.
+    RECT nudged = rect;
+    BOOL nudgeOk = FALSE;
+    if (taskbar) {
+        nudgeOk = SetWindowPos(taskbar, nullptr, rect.left + 120, rect.top, 0, 0,
+                               SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        GetWindowRect(taskbar, &nudged);
+        SetWindowPos(taskbar, nullptr, rect.left, rect.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    g_testOverlay = ShowTestOverlay(rect);
+
+    WCHAR message[4096]{};
+    WCHAR line[256];
+    AppendLine(message, ARRAYSIZE(message),
+               L"Press Ctrl+C to copy this whole text.");
+    _snwprintf_s(line, _TRUNCATE, L"Our pid: %lu", GetCurrentProcessId());
+    AppendLine(message, ARRAYSIZE(message), line);
+    _snwprintf_s(line, _TRUNCATE, L"Shell_TrayWnd: %p  pid %lu", taskbar,
+                 taskbarPid);
+    AppendLine(message, ARRAYSIZE(message), line);
+    _snwprintf_s(line, _TRUNCATE, L"Rect: %d,%d %dx%d", rect.left, rect.top,
+                 rect.right - rect.left, rect.bottom - rect.top);
+    AppendLine(message, ARRAYSIZE(message), line);
+    _snwprintf_s(line, _TRUNCATE, L"Nudge returned %d, rect became %d,%d",
+                 nudgeOk, nudged.left, nudged.top);
+    AppendLine(message, ARRAYSIZE(message), line);
+    _snwprintf_s(line, _TRUNCATE, L"Pink overlay: %p", g_testOverlay);
+    AppendLine(message, ARRAYSIZE(message), line);
+    AppendLine(message, ARRAYSIZE(message), L"Children:");
+    if (taskbar) {
+        DumpWindows(message, ARRAYSIZE(message), taskbar, 0);
+    } else {
+        AppendLine(message, ARRAYSIZE(message), L"(no taskbar window)");
+    }
+
+    MessageBoxW(nullptr, message, L"Taskbar mirror test",
+                MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+
+    if (g_testOverlay) {
+        DestroyWindow(g_testOverlay);
+        g_testOverlay = nullptr;
+    }
 
     SetEnabled(true);
 }
