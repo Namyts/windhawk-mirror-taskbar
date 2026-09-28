@@ -8,6 +8,7 @@
 // @include         StartMenuExperienceHost.exe
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
+// @include         EarTrumpet.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
@@ -26,16 +27,23 @@ any icons or text.
 
 The Start menu and the tray flyouts (hidden icons, quick settings, notification
 center) open on the matching side.
+
+Tray apps which place their popup where the tray used to be (EarTrumpet is
+included) are fixed the same way: a popup touching the taskbar on the far half
+is mirrored next to the tray. Other tray apps can be added in the mod's
+Advanced tab, under the custom process inclusion list.
 */
 // ==/WindhawkModReadme==
 
 #include <windhawk_utils.h>
 
+#include <dwmapi.h>
 #include <roapi.h>
 #include <windowsx.h>
 #include <winstring.h>
 #include <xamlom.h>
 
+#include <algorithm>
 #include <atomic>
 #include <optional>
 #include <string>
@@ -775,6 +783,12 @@ std::wstring GetThreadDescriptionOf(DWORD threadId) {
     return result;
 }
 
+// explorer: the taskbar itself. startMenu: StartMenuExperienceHost.exe.
+// shellFlyouts: ShellHost.exe and ShellExperienceHost.exe. app: any other
+// included process, such as tray apps like EarTrumpet.
+enum class Target { explorer, startMenu, shellFlyouts, app };
+Target g_target;
+
 enum class FlyoutKind {
     none,
     // Always belongs next to the tray.
@@ -782,9 +796,18 @@ enum class FlyoutKind {
     // A generic explorer popup, also used for app thumbnails and Alt+Tab. Only
     // treated as a tray flyout when the tray area was just clicked.
     trayIfClicked,
+    // A tray app's popup. Treated as a tray flyout when it sits against the
+    // taskbar.
+    trayIfTouchingTaskbar,
 };
 
 FlyoutKind GetFlyoutKind(HWND hwnd) {
+    if (g_target == Target::app) {
+        bool topLevel = !(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD) &&
+                        GetAncestor(hwnd, GA_PARENT) == GetDesktopWindow();
+        return topLevel ? FlyoutKind::trayIfTouchingTaskbar : FlyoutKind::none;
+    }
+
     WCHAR className[64];
     if (!GetClassName(hwnd, className, ARRAYSIZE(className))) {
         return FlyoutKind::none;
@@ -842,6 +865,17 @@ void AdjustFlyoutPos(HWND hwnd, int& x, int& y, int cx, int cy) {
         }
     }
 
+    if (kind == FlyoutKind::trayIfTouchingTaskbar) {
+        // Gap between the window and the taskbar, across the taskbar.
+        int gap = vertical
+                      ? std::max<int>(taskbar.left - (x + cx), x - taskbar.right)
+                      : std::max<int>(taskbar.top - (y + cy), y - taskbar.bottom);
+        int maxGap = MulDiv(48, GetDpiForWindow(hwnd), 96);
+        if (gap > maxGap || cx <= 0 || cy <= 0) {
+            return;
+        }
+    }
+
     int center = vertical ? y + cy / 2 : x + cx / 2;
     if (center <= middle) {
         return;
@@ -852,11 +886,32 @@ void AdjustFlyoutPos(HWND hwnd, int& x, int& y, int cx, int cy) {
     } else {
         x = taskbar.left + taskbar.right - x - cx;
     }
-    Wh_Log(L"Moved flyout %p to %d,%d", hwnd, x, y);
+
+    WCHAR className[64]{};
+    GetClassName(hwnd, className, ARRAYSIZE(className));
+    Wh_Log(L"Moved flyout %p (%s) to %d,%d", hwnd, className, x, y);
 }
 
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t SetWindowPos_Original;
+
+// For windows which were positioned earlier and are only being shown now.
+void AdjustCurrentPos(HWND hwnd) {
+    RECT rect;
+    if (!GetWindowRect(hwnd, &rect)) {
+        return;
+    }
+
+    int x = rect.left;
+    int y = rect.top;
+    AdjustFlyoutPos(hwnd, x, y, rect.right - rect.left,
+                    rect.bottom - rect.top);
+    if (x != rect.left || y != rect.top) {
+        SetWindowPos_Original(hwnd, nullptr, x, y, 0, 0,
+                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
                               HWND insertAfter,
                               int x,
@@ -864,7 +919,21 @@ BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
                               int cx,
                               int cy,
                               UINT flags) {
-    if (!(flags & SWP_NOMOVE)) {
+    if ((flags & SWP_NOMOVE) && (flags & SWP_SHOWWINDOW) &&
+        g_target != Target::explorer) {
+        RECT rect{};
+        GetWindowRect(hwnd, &rect);
+        int newX = rect.left;
+        int newY = rect.top;
+        int width = (flags & SWP_NOSIZE) ? rect.right - rect.left : cx;
+        int height = (flags & SWP_NOSIZE) ? rect.bottom - rect.top : cy;
+        AdjustFlyoutPos(hwnd, newX, newY, width, height);
+        if (newX != rect.left || newY != rect.top) {
+            x = newX;
+            y = newY;
+            flags &= ~SWP_NOMOVE;
+        }
+    } else if (!(flags & SWP_NOMOVE)) {
         int width = cx;
         int height = cy;
         if (flags & SWP_NOSIZE) {
@@ -888,6 +957,32 @@ BOOL WINAPI MoveWindow_Hook(HWND hwnd,
                             BOOL repaint) {
     AdjustFlyoutPos(hwnd, x, y, width, height);
     return MoveWindow_Original(hwnd, x, y, width, height, repaint);
+}
+
+using ShowWindow_t = decltype(&ShowWindow);
+ShowWindow_t ShowWindow_Original;
+BOOL WINAPI ShowWindow_Hook(HWND hwnd, int cmdShow) {
+    if (cmdShow != SW_HIDE && cmdShow != SW_MINIMIZE &&
+        cmdShow != SW_SHOWMINIMIZED && cmdShow != SW_SHOWMINNOACTIVE &&
+        cmdShow != SW_FORCEMINIMIZE) {
+        AdjustCurrentPos(hwnd);
+    }
+    return ShowWindow_Original(hwnd, cmdShow);
+}
+
+// Shell flyouts are kept alive and hidden by cloaking, so uncloaking is when
+// they're shown.
+using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
+DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
+HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
+                                          DWORD attribute,
+                                          LPCVOID value,
+                                          DWORD size) {
+    if (attribute == DWMWA_CLOAK && size == sizeof(BOOL) && value &&
+        !*static_cast<const BOOL*>(value)) {
+        AdjustCurrentPos(hwnd);
+    }
+    return DwmSetWindowAttribute_Original(hwnd, attribute, value, size);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1197,23 +1292,23 @@ HRESULT WINAPI RoGetActivationFactory_Hook(HSTRING classId,
 ////////////////////////////////////////////////////////////////////////////////
 // Entry points.
 
-enum class Target { explorer, startMenu, flyoutHost };
-Target g_target;
-
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
-    g_target = Target::explorer;
+    g_target = Target::app;
     WCHAR path[MAX_PATH];
     if (GetModuleFileName(nullptr, path, ARRAYSIZE(path))) {
         PCWSTR name = wcsrchr(path, L'\\');
         name = name ? name + 1 : path;
-        if (_wcsicmp(name, L"StartMenuExperienceHost.exe") == 0) {
+        if (_wcsicmp(name, L"explorer.exe") == 0) {
+            g_target = Target::explorer;
+        } else if (_wcsicmp(name, L"StartMenuExperienceHost.exe") == 0) {
             g_target = Target::startMenu;
         } else if (_wcsicmp(name, L"ShellExperienceHost.exe") == 0 ||
                    _wcsicmp(name, L"ShellHost.exe") == 0) {
-            g_target = Target::flyoutHost;
+            g_target = Target::shellFlyouts;
         }
+        Wh_Log(L"Process %s, target %d", name, static_cast<int>(g_target));
     }
 
     if (g_target == Target::startMenu) {
@@ -1231,7 +1326,20 @@ BOOL Wh_ModInit() {
     WindhawkUtils::SetFunctionHook(MoveWindow, MoveWindow_Hook,
                                    &MoveWindow_Original);
 
-    if (g_target == Target::flyoutHost) {
+    if (g_target != Target::explorer) {
+        WindhawkUtils::SetFunctionHook(ShowWindow, ShowWindow_Hook,
+                                       &ShowWindow_Original);
+
+        HMODULE dwmapi = LoadLibraryEx(L"dwmapi.dll", nullptr,
+                                       LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (auto pDwmSetWindowAttribute =
+                dwmapi ? (DwmSetWindowAttribute_t)GetProcAddress(
+                             dwmapi, "DwmSetWindowAttribute")
+                       : nullptr) {
+            WindhawkUtils::SetFunctionHook(pDwmSetWindowAttribute,
+                                           DwmSetWindowAttribute_Hook,
+                                           &DwmSetWindowAttribute_Original);
+        }
         return TRUE;
     }
 
