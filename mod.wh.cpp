@@ -6,7 +6,6 @@
 // @author          namyts
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
-// @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject
@@ -275,10 +274,10 @@ void TryCreateRoot() {
     }
 }
 
-// Quick settings (and the notification center) are a full-height window with
-// the panel aligned to the bottom, which is where the tray sits before
-// mirroring. The panel is pinned to the top instead. Windows sets the
-// alignment again whenever the panel opens, so it's put back each time.
+// Quick settings are a full-height window with the panel aligned to the
+// bottom, which is where the tray sits before mirroring. The panel is pinned
+// to the top instead. Windows sets the alignment again whenever the panel
+// opens, so it's put back each time.
 struct PinnedElement {
     winrt::weak_ref<wux::FrameworkElement> element;
     wux::VerticalAlignment alignment;
@@ -289,24 +288,26 @@ struct PinnedElement {
 std::vector<PinnedElement> g_pinned;
 bool g_pinning;
 
-bool IsFlyoutPage(const wux::DependencyObject& element) {
-    auto name = winrt::get_class_name(element);
-    return name == L"ControlCenter.ControlCenterPage" ||
-           name == L"ActionCenter.NotificationCenterPage";
+bool IsQuickSettingsPage(const wux::DependencyObject& element) {
+    return element &&
+           winrt::get_class_name(element) == L"ControlCenter.ControlCenterPage";
 }
 
-bool HasFlyoutPageAncestor(wux::DependencyObject node,
-                           const wux::DependencyObject& parent) {
-    // The parent link can be missing for an element that was just added.
-    if (parent && GetParent(node) != parent) {
-        node = parent;
-    }
-    for (; node; node = GetParent(node)) {
-        if (IsFlyoutPage(node)) {
-            return true;
+bool HasName(const wux::DependencyObject& element, std::wstring_view name) {
+    auto fe = element.try_as<wux::FrameworkElement>();
+    return fe && fe.Name() == name;
+}
+
+wux::FrameworkElement FindChild(const wux::DependencyObject& element,
+                                std::wstring_view name) {
+    int count = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < count; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i);
+        if (HasName(child, name)) {
+            return child.as<wux::FrameworkElement>();
         }
     }
-    return false;
+    return nullptr;
 }
 
 void Pin(const wux::FrameworkElement& element, wux::VerticalAlignment alignment) {
@@ -344,8 +345,6 @@ void Pin(const wux::FrameworkElement& element, wux::VerticalAlignment alignment)
             }
         });
     g_pinned.push_back({winrt::make_weak(element), alignment, original, token});
-    Wh_Log(L"Pinned %s / %s", winrt::get_class_name(element).c_str(),
-           element.Name().c_str());
 }
 
 void RestorePins() {
@@ -374,41 +373,26 @@ void OnElementAdded(const wux::FrameworkElement& element,
             return;
         }
 
-        // TEMPORARY: shows whether the quick settings page was found.
-        if (type.find(L"Control") != std::wstring_view::npos ||
-            type.find(L"Action") != std::wstring_view::npos ||
-            element.Name() == L"RootContent" || element.Name() == L"RootGrid") {
-            static int reported = 0;
-            if (reported < 40) {
-                reported++;
-                Wh_Log(L"Shell XAML %.*s name=%s valign=%d", (int)type.size(),
-                       type.data(), element.Name().c_str(),
-                       static_cast<int>(element.VerticalAlignment()));
-            }
-        }
-
-        auto pinPage = [](const wux::FrameworkElement& page) {
-            Pin(page, wux::VerticalAlignment::Stretch);
-            if (auto grid = FindDescendant(page, [](const wux::FrameworkElement& e) {
-                    return e.Name() == L"RootGrid";
-                })) {
-                Pin(grid, wux::VerticalAlignment::Stretch);
-            }
-            if (auto content = FindDescendant(
-                    page, [](const wux::FrameworkElement& e) {
-                        return e.Name() == L"RootContent";
-                    })) {
+        // The page and its RootGrid are stretched to the full height, and the
+        // RootContent inside (the visible panel) is aligned to the top.
+        // Other elements named RootGrid exist deeper inside and are left alone.
+        auto pinContent = [](const wux::FrameworkElement& rootGrid) {
+            Pin(rootGrid, wux::VerticalAlignment::Stretch);
+            if (auto content = FindChild(rootGrid, L"RootContent")) {
                 Pin(content, wux::VerticalAlignment::Top);
             }
         };
 
-        if (IsFlyoutPage(element)) {
-            pinPage(element);
-        } else if (element.Name() == L"RootGrid" &&
-                   HasFlyoutPageAncestor(element, parent)) {
+        if (type == L"ControlCenter.ControlCenterPage") {
             Pin(element, wux::VerticalAlignment::Stretch);
-        } else if (element.Name() == L"RootContent" &&
-                   HasFlyoutPageAncestor(element, parent)) {
+            if (auto rootGrid = FindChild(element, L"RootGrid")) {
+                pinContent(rootGrid);
+            }
+        } else if (element.Name() == L"RootGrid" && IsQuickSettingsPage(parent)) {
+            pinContent(element);
+        } else if (element.Name() == L"RootContent" && parent &&
+                   HasName(parent, L"RootGrid") &&
+                   IsQuickSettingsPage(GetParent(parent))) {
             Pin(element, wux::VerticalAlignment::Top);
         }
         return;
@@ -1066,9 +1050,8 @@ HRESULT WINAPI RoGetActivationFactory_Hook(HSTRING classId,
 }  // namespace StartMenu
 
 ////////////////////////////////////////////////////////////////////////////////
-// Quick settings live in ShellHost.exe, the notification center in
-// ShellExperienceHost.exe. Connecting to their XAML is what lets the panel be
-// moved; creating an island is the moment their XAML runtime is ready.
+// Quick settings live in ShellHost.exe. Its XAML is created on demand, and
+// creating an island is the moment it's ready to be connected to.
 
 using ShellRoGetActivationFactory_t = decltype(&RoGetActivationFactory);
 ShellRoGetActivationFactory_t ShellRoGetActivationFactory_Original;
@@ -1096,8 +1079,7 @@ HWND FindShellWindow() {
             if (GetWindowThreadProcessId(hwnd, &processId) &&
                 processId == GetCurrentProcessId() &&
                 GetClassName(hwnd, className, ARRAYSIZE(className)) &&
-                (_wcsicmp(className, L"ControlCenterWindow") == 0 ||
-                 _wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0)) {
+                _wcsicmp(className, L"ControlCenterWindow") == 0) {
                 *reinterpret_cast<HWND*>(param) = hwnd;
                 return FALSE;
             }
@@ -1179,6 +1161,8 @@ BOOL Wh_ModInit() {
                                        &SetWindowPos_Original);
         WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
                                        &CreateWindowExW_Original);
+    } else if (_wcsicmp(name, L"ShellHost.exe") != 0) {
+        return FALSE;
     } else if (HMODULE winrt =
                    GetModuleHandle(L"api-ms-win-core-winrt-l1-1-0.dll")) {
         if (auto roGetActivationFactory =
@@ -1210,7 +1194,7 @@ void Wh_ModAfterInit() {
         if (FindTaskbarXamlHost()) {
             InjectWindhawkTAP();
         }
-    } else {
+    } else if (FindShellWindow()) {
         InjectWindhawkTAP();
     }
 }
