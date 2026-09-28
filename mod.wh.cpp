@@ -1,606 +1,634 @@
 // ==WindhawkMod==
 // @id              taskbar-mirrored-layout
 // @name            Mirrored Taskbar Layout
-// @description     Mirrors the Windows taskbar layout: on a left/right taskbar the Start button goes to the bottom and the clock to the top
-// @version         1.1
+// @description     Reverses the taskbar order: on a left/right taskbar Start goes to the bottom, apps stack upwards from it, and the clock goes to the top
+// @version         2.0
 // @author          namyts
 // @include         explorer.exe
-// @architecture    x86
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -lcomctl32 -loleacc -loleaut32
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
 # Mirrored Taskbar Layout
 
-Mirrors the order of the Windows taskbar along its length.
+Reverses the order of the Windows 11 taskbar along its length, without flipping
+any icons or text.
 
-* Vertical taskbar (left/right): Start at the bottom, apps above it, clock and
-  notification area at the top.
-* Horizontal taskbar (top/bottom): Start on the right, clock and notification
-  area on the left.
-
-The taskbar window itself stays where Explorer put it. Only the parts inside
-it are reordered. App buttons are reversed as well, so the first app stays
-next to the Start button.
+* Left/right taskbar: Start at the bottom, apps stacked upwards from it (first
+  app next to Start), clock and notification area at the top.
+* Top/bottom taskbar: Start on the right, clock and notification area on the
+  left.
 */
 // ==/WindhawkModReadme==
 
 #include <windhawk_utils.h>
 
-#include <commctrl.h>
-#include <oleacc.h>
-#include <windowsx.h>
+#include <xamlom.h>
 
 #include <atomic>
+#include <vector>
 
-constexpr UINT_PTR kTimerId = 0x4D52;
-constexpr UINT_PTR kSubclassId = 0x4D52;
-constexpr DWORD_PTR kPlaceSubclass = 1;
-constexpr DWORD_PTR kTaskListSubclass = 2;
+#undef GetCurrentTime
 
-constexpr WCHAR kSeenProp[] = L"WhTaskbarMirror.Seen";
-constexpr WCHAR kOrigXProp[] = L"WhTaskbarMirror.OrigX";
-constexpr WCHAR kOrigYProp[] = L"WhTaskbarMirror.OrigY";
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.h>
 
-std::atomic<bool> g_enabled;
-std::atomic<int> g_buttonExtent;
-int g_wasVertical = -1;
-bool g_inTaskListPaint = false;
-bool g_inThumbnailMove = false;
+namespace wf = winrt::Windows::Foundation;
+namespace wux = winrt::Windows::UI::Xaml;
+namespace wuxm = winrt::Windows::UI::Xaml::Media;
 
-using SetWindowPos_t = decltype(&SetWindowPos);
-SetWindowPos_t SetWindowPos_Original;
+////////////////////////////////////////////////////////////////////////////////
+// Mirroring.
+//
+// The element holding both the taskbar frame and the tray frame (the "root")
+// gets a -1 scale along the taskbar's length, which reverses the order of
+// everything in it. Each button and the tray as a whole get the same -1 scale
+// again, so their contents end up the right way round. Render transforms are
+// honored by hit testing, so clicks follow what's on screen.
 
-bool ClassIs(HWND hwnd, const WCHAR* name) {
-    WCHAR cls[64];
-    return GetClassName(hwnd, cls, ARRAYSIZE(cls)) && _wcsicmp(cls, name) == 0;
+struct FlippedElement {
+    winrt::weak_ref<wux::FrameworkElement> element;
+    wuxm::ScaleTransform scale{nullptr};
+    wuxm::Transform originalTransform{nullptr};
+    wf::Point originalOrigin{};
+    size_t rootIndex;
+};
+
+struct MirrorRoot {
+    winrt::weak_ref<wux::FrameworkElement> element;
+    winrt::weak_ref<wux::FrameworkElement> taskbarFrame;
+    winrt::weak_ref<wux::FrameworkElement> trayFrame;
+    winrt::event_token sizeChangedToken{};
+    bool vertical = false;
+};
+
+// Only touched from the taskbar's UI thread.
+std::vector<winrt::weak_ref<wux::FrameworkElement>> g_taskbarFrames;
+std::vector<winrt::weak_ref<wux::FrameworkElement>> g_trayFrames;
+std::vector<MirrorRoot> g_roots;
+std::vector<FlippedElement> g_flipped;
+
+bool IsVertical(const wux::FrameworkElement& element) {
+    return element.ActualHeight() > element.ActualWidth();
 }
 
-bool IsTaskbarWnd(HWND hwnd) {
-    return ClassIs(hwnd, L"Shell_TrayWnd") ||
-           ClassIs(hwnd, L"Shell_SecondaryTrayWnd");
+void SetScaleAxis(const wuxm::ScaleTransform& scale, bool vertical) {
+    scale.ScaleX(vertical ? 1 : -1);
+    scale.ScaleY(vertical ? -1 : 1);
 }
 
-RECT GetRectInParent(HWND hwnd, HWND parent) {
-    RECT rect{};
-    GetWindowRect(hwnd, &rect);
-    MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
-    return rect;
-}
-
-bool IsVerticalTaskbar(HWND taskbar) {
-    RECT client{};
-    GetClientRect(taskbar, &client);
-    return client.bottom - client.top > client.right - client.left;
-}
-
-// The composition background and the off-screen core window fill the taskbar
-// but are not buttons. Moving them makes Explorer undo the whole layout.
-bool IsIgnored(HWND hwnd, HWND parent) {
-    if (ClassIs(hwnd, L"Windows.UI.Composition.DesktopWindowContentBridge") ||
-        ClassIs(hwnd, L"Windows.UI.Core.CoreWindow") ||
-        ClassIs(hwnd, L"Windows.UI.Input.InputSite.WindowClass")) {
-        return true;
-    }
-
-    RECT rect = GetRectInParent(hwnd, parent);
-    int width = rect.right - rect.left;
-    int height = rect.bottom - rect.top;
-    if (width <= 0 || height <= 0 || rect.left < -100 || rect.top < -100) {
-        return true;
-    }
-
-    RECT client{};
-    GetClientRect(parent, &client);
-    if (width > client.right * 3 / 2 || height > client.bottom * 3 / 2) {
-        return true;
-    }
-    if (width >= client.right - 2 && height >= client.bottom - 2) {
-        return true;
+bool IsFlipped(const wux::FrameworkElement& element) {
+    for (const auto& flipped : g_flipped) {
+        if (flipped.element.get() == element) {
+            return true;
+        }
     }
     return false;
 }
 
-bool IsTray(HWND hwnd) {
-    return ClassIs(hwnd, L"TrayNotifyWnd");
-}
+void Flip(const wux::FrameworkElement& element, size_t rootIndex) {
+    std::erase_if(g_flipped, [](const FlippedElement& flipped) {
+        return !flipped.element.get();
+    });
 
-bool IsRebar(HWND hwnd) {
-    return ClassIs(hwnd, L"ReBarWindow32");
-}
-
-bool IsEndDock(HWND hwnd, HWND parent) {
-    return !IsIgnored(hwnd, parent) && !IsTray(hwnd) && !IsRebar(hwnd);
-}
-
-void RememberOriginal(HWND hwnd, HWND parent) {
-    if (GetProp(hwnd, kSeenProp)) {
+    if (IsFlipped(element)) {
         return;
     }
 
-    RECT rect = GetRectInParent(hwnd, parent);
-    SetProp(hwnd, kSeenProp, (HANDLE)1);
-    SetProp(hwnd, kOrigXProp, (HANDLE)(LONG_PTR)rect.left);
-    SetProp(hwnd, kOrigYProp, (HANDLE)(LONG_PTR)rect.top);
+    FlippedElement flipped;
+    flipped.element = winrt::make_weak(element);
+    flipped.originalTransform = element.RenderTransform();
+    flipped.originalOrigin = element.RenderTransformOrigin();
+    flipped.rootIndex = rootIndex;
+    flipped.scale = wuxm::ScaleTransform();
+    SetScaleAxis(flipped.scale, g_roots[rootIndex].vertical);
+
+    if (flipped.originalTransform) {
+        wuxm::TransformGroup group;
+        group.Children().Append(flipped.originalTransform);
+        group.Children().Append(flipped.scale);
+        element.RenderTransform(group);
+    } else {
+        element.RenderTransform(flipped.scale);
+    }
+    element.RenderTransformOrigin({0.5f, 0.5f});
+
+    g_flipped.push_back(std::move(flipped));
 }
 
-int OrigAxis(HWND hwnd, HWND parent, bool vertical) {
-    if (GetProp(hwnd, kSeenProp)) {
-        return (int)(LONG_PTR)GetProp(hwnd, vertical ? kOrigYProp : kOrigXProp);
+void Unflip(FlippedElement& flipped) {
+    auto element = flipped.element.get();
+    if (!element) {
+        return;
     }
 
-    RECT rect = GetRectInParent(hwnd, parent);
-    return vertical ? rect.top : rect.left;
+    if (auto group = element.RenderTransform().try_as<wuxm::TransformGroup>();
+        group && flipped.originalTransform) {
+        group.Children().Clear();
+    }
+    element.RenderTransform(flipped.originalTransform);
+    element.RenderTransformOrigin(flipped.originalOrigin);
 }
 
-int ChildExtent(HWND hwnd, HWND parent, bool vertical) {
-    RECT rect = GetRectInParent(hwnd, parent);
-    return vertical ? rect.bottom - rect.top : rect.right - rect.left;
+wux::DependencyObject GetParent(const wux::DependencyObject& element) {
+    return wuxm::VisualTreeHelper::GetParent(element);
 }
 
-// Distance from the far end to the far side of this window: its own size plus
-// every end-docked sibling that Explorer originally placed before it. The
-// window Explorer put nearest the start edge (Start) therefore lands nearest
-// the far edge.
-int EndDockPrefix(HWND hwnd, HWND parent, bool vertical) {
-    int mine = OrigAxis(hwnd, parent, vertical);
-    int sum = 0;
-    for (HWND child = GetWindow(parent, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        if (!IsEndDock(child, parent)) {
-            continue;
+bool IsAncestorOf(const wux::DependencyObject& ancestor,
+                  wux::DependencyObject element) {
+    while (element) {
+        if (element == ancestor) {
+            return true;
         }
-        int extent = ChildExtent(child, parent, vertical);
-        if (extent <= 0) {
-            continue;
+        element = GetParent(element);
+    }
+    return false;
+}
+
+wux::FrameworkElement FindByName(const wux::DependencyObject& element,
+                                 std::wstring_view name,
+                                 int depth = 0) {
+    if (depth > 12) {
+        return nullptr;
+    }
+
+    int count = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < count; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i);
+        if (auto fe = child.try_as<wux::FrameworkElement>();
+            fe && fe.Name() == name) {
+            return fe;
         }
-        int orig = OrigAxis(child, parent, vertical);
-        if (orig < mine || child == hwnd) {
-            sum += extent;
+        if (auto found = FindByName(child, name, depth + 1)) {
+            return found;
         }
     }
-    return sum;
+    return nullptr;
 }
 
-int EndDockTotal(HWND parent, bool vertical) {
-    int sum = 0;
-    for (HWND child = GetWindow(parent, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        if (IsEndDock(child, parent)) {
-            int extent = ChildExtent(child, parent, vertical);
-            if (extent > 0) {
-                sum += extent;
+// Index of the root that contains the element, or -1.
+int FindRootIndex(const wux::DependencyObject& element) {
+    for (size_t i = 0; i < g_roots.size(); i++) {
+        auto root = g_roots[i].element.get();
+        if (root && IsAncestorOf(root, element)) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void FlipTaskbarButtons(size_t rootIndex) {
+    auto taskbarFrame = g_roots[rootIndex].taskbarFrame.get();
+    if (!taskbarFrame) {
+        return;
+    }
+
+    auto repeater = FindByName(taskbarFrame, L"TaskbarFrameRepeater");
+    if (!repeater) {
+        Wh_Log(L"TaskbarFrameRepeater not found");
+        return;
+    }
+
+    int count = wuxm::VisualTreeHelper::GetChildrenCount(repeater);
+    for (int i = 0; i < count; i++) {
+        if (auto button = wuxm::VisualTreeHelper::GetChild(repeater, i)
+                              .try_as<wux::FrameworkElement>()) {
+            Flip(button, rootIndex);
+        }
+    }
+}
+
+void OnRootSizeChanged(size_t rootIndex) {
+    if (rootIndex >= g_roots.size()) {
+        return;
+    }
+
+    auto root = g_roots[rootIndex].element.get();
+    if (!root) {
+        return;
+    }
+
+    bool vertical = IsVertical(root);
+    if (vertical == g_roots[rootIndex].vertical) {
+        return;
+    }
+
+    Wh_Log(L"Taskbar orientation: %s", vertical ? L"vertical" : L"horizontal");
+    g_roots[rootIndex].vertical = vertical;
+    for (auto& flipped : g_flipped) {
+        if (flipped.rootIndex == rootIndex && flipped.element.get()) {
+            SetScaleAxis(flipped.scale, vertical);
+        }
+    }
+}
+
+// The root is the closest element that contains both frames.
+void TryCreateRoots() {
+    for (const auto& weakTaskbarFrame : g_taskbarFrames) {
+        auto taskbarFrame = weakTaskbarFrame.get();
+        if (!taskbarFrame || FindRootIndex(taskbarFrame) != -1) {
+            continue;
+        }
+
+        for (const auto& weakTrayFrame : g_trayFrames) {
+            auto trayFrame = weakTrayFrame.get();
+            if (!trayFrame) {
+                continue;
             }
-        }
-    }
-    return sum;
-}
 
-bool TargetPos(HWND hwnd, HWND parent, int cx, int cy, int& x, int& y) {
-    RECT client{};
-    GetClientRect(parent, &client);
-    bool vertical = client.bottom > client.right;
-    int limit = vertical ? client.bottom : client.right;
-    int extent = vertical ? cy : cx;
-    if (extent <= 0 || limit <= 0) {
-        return false;
-    }
+            wux::DependencyObject ancestor = GetParent(taskbarFrame);
+            while (ancestor && !IsAncestorOf(ancestor, trayFrame)) {
+                ancestor = GetParent(ancestor);
+            }
 
-    int pos = 0;
-    if (IsTray(hwnd)) {
-        pos = 0;
-    } else if (IsRebar(hwnd)) {
-        pos = limit - EndDockTotal(parent, vertical) - extent;
-    } else if (IsEndDock(hwnd, parent)) {
-        pos = limit - EndDockPrefix(hwnd, parent, vertical);
-    } else {
-        return false;
-    }
-    if (pos < 0) {
-        pos = 0;
-    }
+            auto root = ancestor.try_as<wux::FrameworkElement>();
+            if (!root) {
+                continue;
+            }
 
-    if (vertical) {
-        y = pos;
-    } else {
-        x = pos;
-    }
-    return true;
-}
+            Wh_Log(L"Mirroring taskbar, root %s",
+                   winrt::get_class_name(root).c_str());
 
-void RewritePlacement(HWND hwnd, WINDOWPOS* wp) {
-    HWND parent = GetParent(hwnd);
-    if (!parent || !IsTaskbarWnd(parent)) {
-        return;
-    }
+            size_t rootIndex = g_roots.size();
+            MirrorRoot mirrorRoot;
+            mirrorRoot.element = winrt::make_weak(root);
+            mirrorRoot.taskbarFrame = winrt::make_weak(taskbarFrame);
+            mirrorRoot.trayFrame = winrt::make_weak(trayFrame);
+            mirrorRoot.vertical = IsVertical(root);
+            mirrorRoot.sizeChangedToken = root.SizeChanged(
+                [rootIndex](const wf::IInspectable&,
+                            const wux::SizeChangedEventArgs&) {
+                    OnRootSizeChanged(rootIndex);
+                });
+            g_roots.push_back(std::move(mirrorRoot));
 
-    RECT now = GetRectInParent(hwnd, parent);
-    int cx = (wp->flags & SWP_NOSIZE) ? now.right - now.left : wp->cx;
-    int cy = (wp->flags & SWP_NOSIZE) ? now.bottom - now.top : wp->cy;
-    if ((wp->flags & SWP_NOMOVE) && (wp->flags & SWP_NOSIZE)) {
-        return;
-    }
-
-    int x = (wp->flags & SWP_NOMOVE) ? now.left : wp->x;
-    int y = (wp->flags & SWP_NOMOVE) ? now.top : wp->y;
-    if (!TargetPos(hwnd, parent, cx, cy, x, y)) {
-        return;
-    }
-
-    wp->x = x;
-    wp->y = y;
-    wp->flags &= ~SWP_NOMOVE;
-}
-
-HWND FindTaskList(HWND taskbar) {
-    HWND rebar = FindWindowExW(taskbar, nullptr, L"ReBarWindow32", nullptr);
-    HWND taskSwitch =
-        rebar ? FindWindowExW(rebar, nullptr, L"MSTaskSwWClass", nullptr)
-              : nullptr;
-    return taskSwitch
-               ? FindWindowExW(taskSwitch, nullptr, L"MSTaskListWClass", nullptr)
-               : nullptr;
-}
-
-int MapExtent(int pos, int total) {
-    int button = g_buttonExtent.load();
-    if (button <= 0) {
-        return pos;
-    }
-
-    int count = total / button;
-    int used = count * button;
-    if (count < 2 || pos < 0 || pos >= used) {
-        return pos;
-    }
-
-    int strip = pos / button;
-    int offset = pos % button;
-    return (count - 1 - strip) * button + offset;
-}
-
-POINT MapClientPoint(HWND taskList, POINT pt) {
-    RECT client{};
-    GetClientRect(taskList, &client);
-    HWND taskbar = GetAncestor(taskList, GA_ROOT);
-    if (IsVerticalTaskbar(taskbar)) {
-        pt.y = MapExtent(pt.y, client.bottom);
-    } else {
-        pt.x = MapExtent(pt.x, client.right);
-    }
-    return pt;
-}
-
-void ReverseStrips(HWND taskList) {
-    int button = g_buttonExtent.load();
-    if (button <= 0) {
-        return;
-    }
-
-    RECT client{};
-    GetClientRect(taskList, &client);
-    HWND taskbar = GetAncestor(taskList, GA_ROOT);
-    bool vertical = IsVerticalTaskbar(taskbar);
-    int total = vertical ? client.bottom : client.right;
-    int cross = vertical ? client.right : client.bottom;
-    int count = total / button;
-    if (count < 2 || cross <= 0) {
-        return;
-    }
-
-    HDC hdc = GetDC(taskList);
-    if (!hdc) {
-        return;
-    }
-
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bitmap = CreateCompatibleBitmap(hdc, vertical ? cross : button,
-                                            vertical ? button : cross);
-    HGDIOBJ previous = SelectObject(mem, bitmap);
-
-    for (int i = 0; i < count / 2; i++) {
-        int a = i * button;
-        int b = (count - 1 - i) * button;
-        if (vertical) {
-            BitBlt(mem, 0, 0, cross, button, hdc, 0, a, SRCCOPY);
-            BitBlt(hdc, 0, a, cross, button, hdc, 0, b, SRCCOPY);
-            BitBlt(hdc, 0, b, cross, button, mem, 0, 0, SRCCOPY);
-        } else {
-            BitBlt(mem, 0, 0, button, cross, hdc, a, 0, SRCCOPY);
-            BitBlt(hdc, a, 0, button, cross, hdc, b, 0, SRCCOPY);
-            BitBlt(hdc, b, 0, button, cross, mem, 0, 0, SRCCOPY);
-        }
-    }
-
-    SelectObject(mem, previous);
-    DeleteObject(bitmap);
-    DeleteDC(mem);
-    ReleaseDC(taskList, hdc);
-}
-
-bool RemapMouse(HWND taskList, UINT msg, LPARAM& lParam) {
-    bool screen = false;
-    switch (msg) {
-        case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN:
-        case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN:
-        case WM_RBUTTONUP:
-        case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN:
-        case WM_MBUTTONUP:
-        case WM_MBUTTONDBLCLK:
-        case WM_XBUTTONDOWN:
-        case WM_XBUTTONUP:
-        case WM_XBUTTONDBLCLK:
+            Flip(root, rootIndex);
+            Flip(trayFrame, rootIndex);
+            FlipTaskbarButtons(rootIndex);
             break;
-        case WM_MOUSEWHEEL:
-        case WM_MOUSEHWHEEL:
-        case WM_CONTEXTMENU:
-        case WM_NCHITTEST:
-            screen = true;
+        }
+    }
+}
+
+void OnElementAdded(const wux::FrameworkElement& element,
+                    const wux::FrameworkElement& parent,
+                    std::wstring_view type) {
+    if (type == L"Taskbar.TaskbarFrame") {
+        g_taskbarFrames.push_back(winrt::make_weak(element));
+        TryCreateRoots();
+        return;
+    }
+
+    if (type == L"SystemTray.SystemTrayFrame") {
+        g_trayFrames.push_back(winrt::make_weak(element));
+        TryCreateRoots();
+        return;
+    }
+
+    // Taskbar buttons (Start, search, apps) are created and recycled by the
+    // repeater over time.
+    if (parent && parent.Name() == L"TaskbarFrameRepeater") {
+        int rootIndex = FindRootIndex(parent);
+        if (rootIndex != -1) {
+            Flip(element, rootIndex);
+        }
+    }
+}
+
+void RestoreAll() {
+    for (auto& flipped : g_flipped) {
+        Unflip(flipped);
+    }
+    g_flipped.clear();
+
+    for (auto& root : g_roots) {
+        if (auto element = root.element.get()) {
+            element.SizeChanged(root.sizeChangedToken);
+        }
+    }
+    g_roots.clear();
+    g_taskbarFrames.clear();
+    g_trayFrames.clear();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// XAML diagnostics: gets a callback for every element in explorer's XAML trees.
+
+HMODULE GetCurrentModuleHandle() {
+    HMODULE module;
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           L"", &module)) {
+        return nullptr;
+    }
+    return module;
+}
+
+// The XAML composition diagnostics corrupt the heap when several UI threads add
+// visuals at once. Only element mutations are needed, so the composition
+// diagnostics are turned off by answering the single registry read which
+// AdviseVisualTreeChange makes for DisableCompositionDiag.
+thread_local bool g_reportCompositionDiagAsDisabled;
+
+class VisualTreeWatcher
+    : public winrt::implements<VisualTreeWatcher,
+                               IVisualTreeServiceCallback2,
+                               winrt::non_agile> {
+   public:
+    explicit VisualTreeWatcher(winrt::com_ptr<IUnknown> site)
+        : m_xamlDiagnostics(site.as<IXamlDiagnostics>()) {
+        // Advising from the calling thread can hang, so it's done from a new
+        // thread.
+        HANDLE thread = CreateThread(
+            nullptr, 0,
+            [](LPVOID param) -> DWORD {
+                auto watcher = reinterpret_cast<VisualTreeWatcher*>(param);
+                g_reportCompositionDiagAsDisabled = true;
+                HRESULT hr = watcher->m_xamlDiagnostics.as<IVisualTreeService3>()
+                                 ->AdviseVisualTreeChange(watcher);
+                g_reportCompositionDiagAsDisabled = false;
+                watcher->Release();
+                if (FAILED(hr)) {
+                    Wh_Log(L"AdviseVisualTreeChange failed: %08X", hr);
+                }
+                return 0;
+            },
+            this, 0, nullptr);
+        if (thread) {
+            AddRef();
+            CloseHandle(thread);
+        }
+    }
+
+    void Unadvise() {
+        m_xamlDiagnostics.as<IVisualTreeService3>()->UnadviseVisualTreeChange(
+            this);
+    }
+
+   private:
+    HRESULT STDMETHODCALLTYPE
+    OnVisualTreeChange(ParentChildRelation relation,
+                       VisualElement element,
+                       VisualMutationType mutationType) noexcept override try {
+        if (mutationType != Add) {
+            return S_OK;
+        }
+
+        auto frameworkElement =
+            FromHandle(element.Handle).try_as<wux::FrameworkElement>();
+        if (!frameworkElement) {
+            return S_OK;
+        }
+
+        wux::FrameworkElement parent{nullptr};
+        if (relation.Parent) {
+            parent = FromHandle(relation.Parent).try_as<wux::FrameworkElement>();
+        }
+
+        OnElementAdded(frameworkElement, parent,
+                       element.Type ? element.Type : L"");
+        return S_OK;
+    } catch (...) {
+        Wh_Log(L"Error %08X", winrt::to_hresult());
+        // An error return stops further notifications.
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnElementStateChanged(InstanceHandle,
+                                                    VisualElementState,
+                                                    LPCWSTR) noexcept override {
+        return S_OK;
+    }
+
+    wf::IInspectable FromHandle(InstanceHandle handle) {
+        wf::IInspectable object;
+        winrt::check_hresult(m_xamlDiagnostics->GetIInspectableFromHandle(
+            handle, reinterpret_cast<::IInspectable**>(winrt::put_abi(object))));
+        return object;
+    }
+
+    winrt::com_ptr<IXamlDiagnostics> m_xamlDiagnostics;
+};
+
+winrt::com_ptr<VisualTreeWatcher> g_visualTreeWatcher;
+
+// {C85D8CC7-5463-40E8-A432-F5916B6427E5}
+constexpr CLSID CLSID_WindhawkTAP = {
+    0xc85d8cc7,
+    0x5463,
+    0x40e8,
+    {0xa4, 0x32, 0xf5, 0x91, 0x6b, 0x64, 0x27, 0xe5}};
+
+class WindhawkTAP
+    : public winrt::implements<WindhawkTAP, IObjectWithSite, winrt::non_agile> {
+   public:
+    HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site) noexcept override try {
+        if (g_visualTreeWatcher) {
+            g_visualTreeWatcher->Unadvise();
+            g_visualTreeWatcher = nullptr;
+        }
+
+        m_site.copy_from(site);
+        if (m_site) {
+            // Undo the reference taken by InitializeXamlDiagnosticsEx.
+            FreeLibrary(GetCurrentModuleHandle());
+            g_visualTreeWatcher = winrt::make_self<VisualTreeWatcher>(m_site);
+        }
+        return S_OK;
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSite(REFIID riid,
+                                      void** site) noexcept override {
+        return m_site.as(riid, site);
+    }
+
+   private:
+    winrt::com_ptr<IUnknown> m_site;
+};
+
+struct TapFactory
+    : winrt::implements<TapFactory, IClassFactory, winrt::non_agile> {
+    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer,
+                                             REFIID riid,
+                                             void** object) noexcept override try {
+        *object = nullptr;
+        if (outer) {
+            return CLASS_E_NOAGGREGATION;
+        }
+        return winrt::make<WindhawkTAP>().as(riid, object);
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+
+    HRESULT STDMETHODCALLTYPE LockServer(BOOL) noexcept override { return S_OK; }
+};
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdll-attribute-on-redeclaration"
+
+__declspec(dllexport) _Use_decl_annotations_ STDAPI
+    DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) try {
+    *ppv = nullptr;
+    if (rclsid != CLSID_WindhawkTAP) {
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+    return winrt::make<TapFactory>().as(riid, ppv);
+} catch (...) {
+    return winrt::to_hresult();
+}
+
+__declspec(dllexport) _Use_decl_annotations_ STDAPI DllCanUnloadNow() {
+    return winrt::get_module_lock() ? S_FALSE : S_OK;
+}
+
+#pragma clang diagnostic pop
+
+std::atomic<bool> g_tapInjected;
+
+void InjectWindhawkTAP() {
+    if (g_tapInjected.exchange(true)) {
+        return;
+    }
+
+    WCHAR location[MAX_PATH];
+    HMODULE module = GetCurrentModuleHandle();
+    if (!module || !GetModuleFileName(module, location, ARRAYSIZE(location))) {
+        return;
+    }
+
+    HMODULE wux = LoadLibraryEx(L"Windows.UI.Xaml.dll", nullptr,
+                                LOAD_LIBRARY_SEARCH_SYSTEM32);
+    auto initializeXamlDiagnosticsEx =
+        wux ? reinterpret_cast<decltype(&InitializeXamlDiagnosticsEx)>(
+                  GetProcAddress(wux, "InitializeXamlDiagnosticsEx"))
+            : nullptr;
+    if (!initializeXamlDiagnosticsEx) {
+        Wh_Log(L"InitializeXamlDiagnosticsEx not found");
+        return;
+    }
+
+    // There's no way to know which connection name is free, so try them in
+    // order.
+    HRESULT hr = E_FAIL;
+    for (int i = 1; i <= 10000; i++) {
+        WCHAR connectionName[64];
+        wsprintf(connectionName, L"VisualDiagConnection%d", i);
+        hr = initializeXamlDiagnosticsEx(connectionName, GetCurrentProcessId(),
+                                         L"", location, CLSID_WindhawkTAP,
+                                         nullptr);
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
             break;
-        default:
-            return false;
-    }
-
-    POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-    if (screen) {
-        ScreenToClient(taskList, &pt);
-    }
-    pt = MapClientPoint(taskList, pt);
-    if (screen) {
-        ClientToScreen(taskList, &pt);
-    }
-    lParam = MAKELPARAM((SHORT)pt.x, (SHORT)pt.y);
-    return true;
-}
-
-LRESULT CALLBACK MirrorSubclassProc(HWND hwnd,
-                                    UINT msg,
-                                    WPARAM wParam,
-                                    LPARAM lParam,
-                                    UINT_PTR id,
-                                    DWORD_PTR ref) {
-    if (msg == WM_NCDESTROY) {
-        RemoveWindowSubclass(hwnd, MirrorSubclassProc, id);
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-    }
-
-    if (!g_enabled) {
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-    }
-
-    if (ref == kTaskListSubclass) {
-        if (msg == WM_PAINT && !g_inTaskListPaint) {
-            RECT client{};
-            GetClientRect(hwnd, &client);
-            InvalidateRect(hwnd, &client, FALSE);
-
-            g_inTaskListPaint = true;
-            LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
-            g_inTaskListPaint = false;
-
-            ReverseStrips(hwnd);
-            return result;
-        }
-
-        RemapMouse(hwnd, msg, lParam);
-        return DefSubclassProc(hwnd, msg, wParam, lParam);
-    }
-
-    if (msg == WM_WINDOWPOSCHANGING) {
-        RewritePlacement(hwnd, reinterpret_cast<WINDOWPOS*>(lParam));
-    }
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
-}
-
-void PlaceWindow(HWND hwnd, HWND parent) {
-    RECT now = GetRectInParent(hwnd, parent);
-    int x = now.left;
-    int y = now.top;
-    int cx = now.right - now.left;
-    int cy = now.bottom - now.top;
-    if (!TargetPos(hwnd, parent, cx, cy, x, y)) {
-        return;
-    }
-    if (x == now.left && y == now.top) {
-        return;
-    }
-
-    Wh_Log(L"Move %p -> %d,%d", hwnd, x, y);
-    SetWindowPos(hwnd, nullptr, x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-int MeasureButtonExtent(HWND taskList, bool vertical) {
-    DWORD toolbar = (DWORD)SendMessage(taskList, TB_GETBUTTONSIZE, 0, 0);
-    int fromToolbar = vertical ? HIWORD(toolbar) : LOWORD(toolbar);
-    if (fromToolbar >= 24 && fromToolbar <= 96) {
-        return fromToolbar;
-    }
-
-    static const GUID kIID_IAccessible = {
-        0x618736e0,
-        0x3c3d,
-        0x11cf,
-        {0x81, 0x0c, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
-
-    IAccessible* accessible = nullptr;
-    if (FAILED(AccessibleObjectFromWindow(
-            taskList, OBJID_CLIENT, kIID_IAccessible,
-            reinterpret_cast<void**>(&accessible))) ||
-        !accessible) {
-        return 0;
-    }
-
-    long count = 0;
-    accessible->get_accChildCount(&count);
-    int extent = 0;
-    for (long i = 1; i <= count && i <= 8; i++) {
-        VARIANT child;
-        VariantInit(&child);
-        child.vt = VT_I4;
-        child.lVal = i;
-
-        long x = 0;
-        long y = 0;
-        long width = 0;
-        long height = 0;
-        if (SUCCEEDED(accessible->accLocation(&x, &y, &width, &height, child))) {
-            int candidate = vertical ? height : width;
-            if (candidate >= 24 && candidate <= 96) {
-                extent = candidate;
-                VariantClear(&child);
-                break;
-            }
-        }
-        VariantClear(&child);
-    }
-
-    accessible->Release();
-    return extent;
-}
-
-void EnsureTaskbar(HWND taskbar) {
-    bool vertical = IsVerticalTaskbar(taskbar);
-    if (g_wasVertical != (int)vertical) {
-        if (g_wasVertical != -1) {
-            for (HWND child = GetWindow(taskbar, GW_CHILD); child;
-                 child = GetWindow(child, GW_HWNDNEXT)) {
-                RemoveProp(child, kSeenProp);
-                RemoveProp(child, kOrigXProp);
-                RemoveProp(child, kOrigYProp);
-            }
-        }
-        g_wasVertical = (int)vertical;
-    }
-
-    for (HWND child = GetWindow(taskbar, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        if (IsIgnored(child, taskbar)) {
-            continue;
-        }
-        if (!IsTray(child) && !IsRebar(child) && !IsEndDock(child, taskbar)) {
-            continue;
-        }
-
-        RememberOriginal(child, taskbar);
-        SetWindowSubclass(child, MirrorSubclassProc, kSubclassId, kPlaceSubclass);
-    }
-
-    for (HWND child = GetWindow(taskbar, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        if (!IsIgnored(child, taskbar) &&
-            (IsTray(child) || IsRebar(child) || IsEndDock(child, taskbar))) {
-            PlaceWindow(child, taskbar);
         }
     }
-
-    HWND taskList = FindTaskList(taskbar);
-    if (!taskList) {
-        return;
-    }
-
-    SetWindowSubclass(taskList, MirrorSubclassProc, kSubclassId,
-                      kTaskListSubclass);
-
-    int extent = MeasureButtonExtent(taskList, vertical);
-    if (extent > 0 && extent != g_buttonExtent.load()) {
-        g_buttonExtent = extent;
-        Wh_Log(L"Button extent %d", extent);
-        InvalidateRect(taskList, nullptr, TRUE);
-    }
+    Wh_Log(L"InitializeXamlDiagnosticsEx: %08X", hr);
 }
 
-void RestoreTaskbar(HWND taskbar) {
-    KillTimer(taskbar, kTimerId);
+////////////////////////////////////////////////////////////////////////////////
+// Hooks.
 
-    HWND taskList = FindTaskList(taskbar);
-    if (taskList) {
-        RemoveWindowSubclass(taskList, MirrorSubclassProc, kSubclassId);
+using RegOpenKeyExW_t = decltype(&RegOpenKeyExW);
+RegOpenKeyExW_t RegOpenKeyExW_Original;
+LSTATUS WINAPI RegOpenKeyExW_Hook(HKEY key,
+                                  LPCWSTR subKey,
+                                  DWORD options,
+                                  REGSAM samDesired,
+                                  PHKEY result) {
+    LSTATUS status =
+        RegOpenKeyExW_Original(key, subKey, options, samDesired, result);
+    if (status == ERROR_SUCCESS || !g_reportCompositionDiagAsDisabled ||
+        key != HKEY_LOCAL_MACHINE || !subKey ||
+        _wcsicmp(subKey, L"Software\\Microsoft\\XAML\\Debug") != 0) {
+        return status;
     }
 
-    for (HWND child = GetWindow(taskbar, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        if (!GetProp(child, kSeenProp)) {
-            continue;
+    // The value is only queried if the key opens, so hand out one that exists.
+    return RegOpenKeyExW_Original(HKEY_LOCAL_MACHINE, L"Software\\Microsoft",
+                                  options, samDesired, result);
+}
+
+using RegQueryValueExW_t = decltype(&RegQueryValueExW);
+RegQueryValueExW_t RegQueryValueExW_Original;
+LSTATUS WINAPI RegQueryValueExW_Hook(HKEY key,
+                                     LPCWSTR valueName,
+                                     LPDWORD reserved,
+                                     LPDWORD type,
+                                     LPBYTE data,
+                                     LPDWORD dataSize) {
+    if (!g_reportCompositionDiagAsDisabled || !valueName ||
+        _wcsicmp(valueName, L"DisableCompositionDiag") != 0) {
+        return RegQueryValueExW_Original(key, valueName, reserved, type, data,
+                                         dataSize);
+    }
+
+    if (type) {
+        *type = REG_DWORD;
+    }
+    if (data && (!dataSize || *dataSize < sizeof(DWORD))) {
+        if (dataSize) {
+            *dataSize = sizeof(DWORD);
         }
-
-        int x = (int)(LONG_PTR)GetProp(child, kOrigXProp);
-        int y = (int)(LONG_PTR)GetProp(child, kOrigYProp);
-        RemoveWindowSubclass(child, MirrorSubclassProc, kSubclassId);
-        RemoveProp(child, kSeenProp);
-        RemoveProp(child, kOrigXProp);
-        RemoveProp(child, kOrigYProp);
-        SetWindowPos(child, nullptr, x, y, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return ERROR_MORE_DATA;
     }
-
-    if (taskList) {
-        InvalidateRect(taskList, nullptr, TRUE);
+    if (data) {
+        *reinterpret_cast<DWORD*>(data) = 1;
     }
+    if (dataSize) {
+        *dataSize = sizeof(DWORD);
+    }
+    return ERROR_SUCCESS;
 }
 
-void CALLBACK EnforceTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
-    if (!g_enabled || !IsTaskbarWnd(hwnd)) {
-        KillTimer(hwnd, kTimerId);
-        return;
-    }
-    EnsureTaskbar(hwnd);
+bool IsTaskbarXamlHost(HWND hwnd, HWND parent) {
+    WCHAR className[64];
+    return parent &&
+           GetClassName(hwnd, className, ARRAYSIZE(className)) &&
+           _wcsicmp(className,
+                    L"Windows.UI.Composition.DesktopWindowContentBridge") == 0 &&
+           GetClassName(parent, className, ARRAYSIZE(className)) &&
+           _wcsicmp(className, L"Shell_TrayWnd") == 0;
 }
 
-BOOL CALLBACK TaskbarEnumProc(HWND hwnd, LPARAM lParam) {
+// Picks up the taskbar when explorer starts with the mod already enabled.
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_Original;
+HWND WINAPI CreateWindowExW_Hook(DWORD exStyle,
+                                 LPCWSTR className,
+                                 LPCWSTR windowName,
+                                 DWORD style,
+                                 int x,
+                                 int y,
+                                 int width,
+                                 int height,
+                                 HWND parent,
+                                 HMENU menu,
+                                 HINSTANCE instance,
+                                 LPVOID param) {
+    HWND hwnd = CreateWindowExW_Original(exStyle, className, windowName, style,
+                                         x, y, width, height, parent, menu,
+                                         instance, param);
+    if (hwnd && IsTaskbarXamlHost(hwnd, parent)) {
+        Wh_Log(L"Taskbar XAML host created");
+        InjectWindhawkTAP();
+    }
+    return hwnd;
+}
+
+HWND FindTaskbarXamlHost() {
+    HWND taskbar = FindWindow(L"Shell_TrayWnd", nullptr);
     DWORD processId = 0;
-    bool enable = lParam != 0;
-    if (!GetWindowThreadProcessId(hwnd, &processId) ||
-        processId != GetCurrentProcessId() || !IsTaskbarWnd(hwnd)) {
-        return TRUE;
+    if (!taskbar || !GetWindowThreadProcessId(taskbar, &processId) ||
+        processId != GetCurrentProcessId()) {
+        return nullptr;
     }
-
-    if (enable) {
-        SetTimer(hwnd, kTimerId, 400, EnforceTimerProc);
-        EnsureTaskbar(hwnd);
-    } else {
-        RestoreTaskbar(hwnd);
-    }
-    return TRUE;
-}
-
-void ApplyAll(bool enable) {
-    EnumWindows(TaskbarEnumProc, enable ? 1 : 0);
-}
-
-BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
-                              HWND insertAfter,
-                              int x,
-                              int y,
-                              int cx,
-                              int cy,
-                              UINT flags) {
-    if (g_enabled && !g_inThumbnailMove && !(flags & SWP_NOMOVE) &&
-        ClassIs(hwnd, L"TaskListThumbnailWnd") && g_buttonExtent.load() > 0) {
-        HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-        HWND taskList = taskbar ? FindTaskList(taskbar) : nullptr;
-        if (taskList) {
-            POINT anchor{x + cx / 2, y + cy / 2};
-            POINT mapped = anchor;
-            ScreenToClient(taskList, &mapped);
-            mapped = MapClientPoint(taskList, mapped);
-            ClientToScreen(taskList, &mapped);
-            x += mapped.x - anchor.x;
-            y += mapped.y - anchor.y;
-        }
-    }
-
-    g_inThumbnailMove = true;
-    BOOL result =
-        SetWindowPos_Original(hwnd, insertAfter, x, y, cx, cy, flags);
-    g_inThumbnailMove = false;
-    return result;
+    return FindWindowEx(taskbar, nullptr,
+                        L"Windows.UI.Composition.DesktopWindowContentBridge",
+                        nullptr);
 }
 
 using RunFromWindowThreadProc_t = void (*)(PVOID);
@@ -614,7 +642,7 @@ UINT g_runFromWindowThreadMsg;
 
 LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION) {
-        const CWPSTRUCT* msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
+        auto* msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
         if (msg->message == g_runFromWindowThreadMsg) {
             auto* param = reinterpret_cast<RunFromWindowThreadParam*>(msg->lParam);
             param->proc(param->procParam);
@@ -638,8 +666,8 @@ bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc_t proc, PVOID param)
         return true;
     }
 
-    HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROC, RunFromWindowThreadHook,
-                                   nullptr, threadId);
+    HHOOK hook = SetWindowsHookEx(WH_CALLWNDPROC, RunFromWindowThreadHook,
+                                  nullptr, threadId);
     if (!hook) {
         return false;
     }
@@ -650,38 +678,40 @@ bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc_t proc, PVOID param)
     return true;
 }
 
-void SetEnabled(bool enable) {
-    g_enabled = enable;
-
-    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-    DWORD processId = 0;
-    if (!taskbar || !GetWindowThreadProcessId(taskbar, &processId) ||
-        processId != GetCurrentProcessId()) {
-        return;
-    }
-
-    auto proc = [](PVOID p) { ApplyAll(*static_cast<bool*>(p)); };
-    if (!RunFromWindowThread(taskbar, proc, &enable)) {
-        ApplyAll(enable);
-    }
-}
-
 BOOL Wh_ModInit() {
     Wh_Log(L">");
 
-    if (!WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
-                                        &SetWindowPos_Original)) {
-        Wh_Log(L"SetWindowPos hook failed");
-    }
+    WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
+                                   &CreateWindowExW_Original);
+
+    HMODULE kernelBase = GetModuleHandle(L"kernelbase.dll");
+    WindhawkUtils::SetFunctionHook(
+        (RegOpenKeyExW_t)GetProcAddress(kernelBase, "RegOpenKeyExW"),
+        RegOpenKeyExW_Hook, &RegOpenKeyExW_Original);
+    WindhawkUtils::SetFunctionHook(
+        (RegQueryValueExW_t)GetProcAddress(kernelBase, "RegQueryValueExW"),
+        RegQueryValueExW_Hook, &RegQueryValueExW_Original);
+
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
     Wh_Log(L">");
-    SetEnabled(true);
+
+    if (FindTaskbarXamlHost()) {
+        InjectWindhawkTAP();
+    }
 }
 
 void Wh_ModUninit() {
     Wh_Log(L">");
-    SetEnabled(false);
+
+    if (g_visualTreeWatcher) {
+        g_visualTreeWatcher->Unadvise();
+        g_visualTreeWatcher = nullptr;
+    }
+
+    if (HWND host = FindTaskbarXamlHost()) {
+        RunFromWindowThread(host, [](PVOID) { RestoreAll(); }, nullptr);
+    }
 }
