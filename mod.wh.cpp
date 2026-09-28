@@ -2,13 +2,12 @@
 // @id              taskbar-mirrored-layout
 // @name            Mirrored Taskbar Layout
 // @description     Reverses the taskbar order: on a left/right taskbar Start goes to the bottom, apps stack upwards from it, and the clock goes to the top
-// @version         2.1
+// @version         3.0
 // @author          namyts
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
 // @include         ShellExperienceHost.exe
 // @include         ShellHost.exe
-// @include         EarTrumpet.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
@@ -20,18 +19,13 @@
 Reverses the order of the Windows 11 taskbar along its length, without flipping
 any icons or text.
 
-* Left/right taskbar: Start at the bottom, apps stacked upwards from it (first
-  app next to Start), clock and notification area at the top.
+* Left/right taskbar: Start at the bottom, apps stacked upwards from it, clock
+  and notification area at the top.
 * Top/bottom taskbar: Start on the right, clock and notification area on the
   left.
 
 The Start menu and the tray flyouts (hidden icons, quick settings, notification
 center) open on the matching side.
-
-Tray apps which place their popup where the tray used to be (EarTrumpet is
-included) are fixed the same way: a popup touching the taskbar on the far half
-is mirrored next to the tray. Other tray apps can be added in the mod's
-Advanced tab, under the custom process inclusion list.
 */
 // ==/WindhawkModReadme==
 
@@ -43,7 +37,6 @@ Advanced tab, under the custom process inclusion list.
 #include <winstring.h>
 #include <xamlom.h>
 
-#include <algorithm>
 #include <atomic>
 #include <optional>
 #include <string>
@@ -62,44 +55,77 @@ namespace wf = winrt::Windows::Foundation;
 namespace wux = winrt::Windows::UI::Xaml;
 namespace wuxm = winrt::Windows::UI::Xaml::Media;
 
+std::atomic<bool> g_unloading;
+
+bool GetTaskbarRect(RECT* rect) {
+    HWND taskbar = FindWindow(L"Shell_TrayWnd", nullptr);
+    return taskbar && GetWindowRect(taskbar, rect);
+}
+
+bool IsTaskbarVertical() {
+    RECT rect;
+    return GetTaskbarRect(&rect) &&
+           rect.bottom - rect.top > rect.right - rect.left;
+}
+
+wux::DependencyObject GetParent(const wux::DependencyObject& element) {
+    return wuxm::VisualTreeHelper::GetParent(element);
+}
+
+bool IsAncestorOf(const wux::DependencyObject& ancestor,
+                  wux::DependencyObject element) {
+    for (; element; element = GetParent(element)) {
+        if (element == ancestor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename Predicate>
+wux::FrameworkElement FindDescendant(const wux::DependencyObject& element,
+                                     Predicate predicate) {
+    int count = wuxm::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < count; i++) {
+        auto child = wuxm::VisualTreeHelper::GetChild(element, i);
+        if (auto fe = child.try_as<wux::FrameworkElement>();
+            fe && predicate(fe)) {
+            return fe;
+        }
+        if (auto found = FindDescendant(child, predicate)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
-// Mirroring.
+// Taskbar (explorer.exe).
 //
-// The element holding both the taskbar frame and the tray frame (the "root")
+// The element holding both the taskbar frame and the tray frame (the root)
 // gets a -1 scale along the taskbar's length, which reverses the order of
-// everything in it. Each taskbar button and each tray icon get the same -1
-// scale again, so their contents end up the right way round. Render transforms
-// are honored by hit testing, so clicks follow what's on screen.
+// everything in it. Each taskbar button and tray icon gets the same -1 scale
+// again, so its contents end up the right way round. Hit testing honors render
+// transforms, so clicks follow what's on screen.
 
 struct FlippedElement {
     winrt::weak_ref<wux::FrameworkElement> element;
-    wuxm::ScaleTransform scale{nullptr};
+    wuxm::ScaleTransform scale;
     wuxm::Transform originalTransform{nullptr};
-    wf::Point originalOrigin{};
-    size_t rootIndex;
-};
-
-struct MirrorRoot {
-    winrt::weak_ref<wux::FrameworkElement> element;
-    winrt::weak_ref<wux::FrameworkElement> taskbarFrame;
-    winrt::weak_ref<wux::FrameworkElement> trayFrame;
-    winrt::event_token sizeChangedToken{};
-    bool vertical = false;
+    wf::Point originalOrigin;
 };
 
 // Only touched from the taskbar's UI thread.
 std::vector<winrt::weak_ref<wux::FrameworkElement>> g_taskbarFrames;
-std::vector<winrt::weak_ref<wux::FrameworkElement>> g_trayFrames;
-std::vector<MirrorRoot> g_roots;
+winrt::weak_ref<wux::FrameworkElement> g_trayFrame;
+winrt::weak_ref<wux::FrameworkElement> g_root;
+winrt::event_token g_rootSizeChangedToken;
+bool g_vertical;
 std::vector<FlippedElement> g_flipped;
 
-bool IsVertical(const wux::FrameworkElement& element) {
-    return element.ActualHeight() > element.ActualWidth();
-}
-
-void SetScaleAxis(const wuxm::ScaleTransform& scale, bool vertical) {
-    scale.ScaleX(vertical ? 1 : -1);
-    scale.ScaleY(vertical ? -1 : 1);
+void SetScaleAxis(const wuxm::ScaleTransform& scale) {
+    scale.ScaleX(g_vertical ? 1 : -1);
+    scale.ScaleY(g_vertical ? -1 : 1);
 }
 
 bool IsFlipped(const wux::FrameworkElement& element) {
@@ -111,22 +137,20 @@ bool IsFlipped(const wux::FrameworkElement& element) {
     return false;
 }
 
-void Flip(const wux::FrameworkElement& element, size_t rootIndex) {
-    std::erase_if(g_flipped, [](const FlippedElement& flipped) {
-        return !flipped.element.get();
-    });
-
+// Adds to any transform already there, so that styling mods keep working.
+void Flip(const wux::FrameworkElement& element) {
+    std::erase_if(g_flipped,
+                  [](const FlippedElement& f) { return !f.element.get(); });
     if (IsFlipped(element)) {
         return;
     }
 
-    FlippedElement flipped;
-    flipped.element = winrt::make_weak(element);
-    flipped.originalTransform = element.RenderTransform();
-    flipped.originalOrigin = element.RenderTransformOrigin();
-    flipped.rootIndex = rootIndex;
-    flipped.scale = wuxm::ScaleTransform();
-    SetScaleAxis(flipped.scale, g_roots[rootIndex].vertical);
+    FlippedElement flipped{
+        .element = winrt::make_weak(element),
+        .originalTransform = element.RenderTransform(),
+        .originalOrigin = element.RenderTransformOrigin(),
+    };
+    SetScaleAxis(flipped.scale);
 
     if (flipped.originalTransform) {
         wuxm::TransformGroup group;
@@ -141,7 +165,7 @@ void Flip(const wux::FrameworkElement& element, size_t rootIndex) {
     g_flipped.push_back(std::move(flipped));
 }
 
-void Unflip(FlippedElement& flipped) {
+void Unflip(const FlippedElement& flipped) {
     auto element = flipped.element.get();
     if (!element) {
         return;
@@ -155,63 +179,8 @@ void Unflip(FlippedElement& flipped) {
     element.RenderTransformOrigin(flipped.originalOrigin);
 }
 
-wux::DependencyObject GetParent(const wux::DependencyObject& element) {
-    return wuxm::VisualTreeHelper::GetParent(element);
-}
-
-bool IsAncestorOf(const wux::DependencyObject& ancestor,
-                  wux::DependencyObject element) {
-    while (element) {
-        if (element == ancestor) {
-            return true;
-        }
-        element = GetParent(element);
-    }
-    return false;
-}
-
-wux::FrameworkElement FindByName(const wux::DependencyObject& element,
-                                 std::wstring_view name,
-                                 int depth = 0) {
-    if (depth > 12) {
-        return nullptr;
-    }
-
-    int count = wuxm::VisualTreeHelper::GetChildrenCount(element);
-    for (int i = 0; i < count; i++) {
-        auto child = wuxm::VisualTreeHelper::GetChild(element, i);
-        if (auto fe = child.try_as<wux::FrameworkElement>();
-            fe && fe.Name() == name) {
-            return fe;
-        }
-        if (auto found = FindByName(child, name, depth + 1)) {
-            return found;
-        }
-    }
-    return nullptr;
-}
-
-// Index of the root that contains the element, or -1.
-int FindRootIndex(const wux::DependencyObject& element) {
-    for (size_t i = 0; i < g_roots.size(); i++) {
-        auto root = g_roots[i].element.get();
-        if (root && IsAncestorOf(root, element)) {
-            return static_cast<int>(i);
-        }
-    }
-    return -1;
-}
-
-// Tray icons (the chevron, app icons, network/volume, the clock, ...) are all
-// SystemTray.*IconView elements.
-bool IsTrayIconType(std::wstring_view type) {
-    return type.starts_with(L"SystemTray.") && type.ends_with(L"IconView");
-}
-
-// A tray icon inside an already flipped one must not be flipped again, or it
-// would end up upside down.
-bool HasFlippedAncestor(const wux::DependencyObject& element,
-                        const wux::DependencyObject& root) {
+bool HasFlippedAncestor(const wux::DependencyObject& element) {
+    auto root = g_root.get();
     for (auto ancestor = GetParent(element); ancestor && ancestor != root;
          ancestor = GetParent(ancestor)) {
         if (auto fe = ancestor.try_as<wux::FrameworkElement>();
@@ -222,176 +191,119 @@ bool HasFlippedAncestor(const wux::DependencyObject& element,
     return false;
 }
 
-void FlipTrayIcons(const wux::DependencyObject& element,
-                   size_t rootIndex,
-                   int depth = 0) {
-    if (depth > 20) {
-        return;
+// Taskbar buttons (Start, search, apps) are the repeater's children. Tray
+// icons (chevron, app icons, network/volume, clock, ...) are
+// SystemTray.*IconView elements, and one inside another must be left alone or
+// it would end up upside down.
+bool ShouldFlip(const wux::FrameworkElement& element,
+                const wux::DependencyObject& parent,
+                std::wstring_view type) {
+    if (auto parentFe = parent.try_as<wux::FrameworkElement>();
+        parentFe && parentFe.Name() == L"TaskbarFrameRepeater") {
+        return true;
     }
 
+    auto trayFrame = g_trayFrame.get();
+    return type.starts_with(L"SystemTray.") && type.ends_with(L"IconView") &&
+           trayFrame && IsAncestorOf(trayFrame, element) &&
+           !HasFlippedAncestor(element);
+}
+
+void FlipDescendants(const wux::DependencyObject& element) {
     int count = wuxm::VisualTreeHelper::GetChildrenCount(element);
     for (int i = 0; i < count; i++) {
         auto child = wuxm::VisualTreeHelper::GetChild(element, i);
         auto fe = child.try_as<wux::FrameworkElement>();
-        if (fe && IsTrayIconType(winrt::get_class_name(fe))) {
-            Flip(fe, rootIndex);
-            continue;
-        }
-        FlipTrayIcons(child, rootIndex, depth + 1);
-    }
-}
-
-void FlipTaskbarButtons(size_t rootIndex) {
-    auto taskbarFrame = g_roots[rootIndex].taskbarFrame.get();
-    if (!taskbarFrame) {
-        return;
-    }
-
-    auto repeater = FindByName(taskbarFrame, L"TaskbarFrameRepeater");
-    if (!repeater) {
-        Wh_Log(L"TaskbarFrameRepeater not found");
-        return;
-    }
-
-    int count = wuxm::VisualTreeHelper::GetChildrenCount(repeater);
-    for (int i = 0; i < count; i++) {
-        if (auto button = wuxm::VisualTreeHelper::GetChild(repeater, i)
-                              .try_as<wux::FrameworkElement>()) {
-            Flip(button, rootIndex);
+        if (fe && ShouldFlip(fe, element, winrt::get_class_name(fe))) {
+            Flip(fe);
+        } else {
+            FlipDescendants(child);
         }
     }
 }
 
-void OnRootSizeChanged(size_t rootIndex) {
-    if (rootIndex >= g_roots.size()) {
+void OnRootSizeChanged() {
+    auto root = g_root.get();
+    bool vertical = root && root.ActualHeight() > root.ActualWidth();
+    if (!root || vertical == g_vertical) {
         return;
     }
 
-    auto root = g_roots[rootIndex].element.get();
-    if (!root) {
-        return;
-    }
-
-    bool vertical = IsVertical(root);
-    if (vertical == g_roots[rootIndex].vertical) {
-        return;
-    }
-
-    Wh_Log(L"Taskbar orientation: %s", vertical ? L"vertical" : L"horizontal");
-    g_roots[rootIndex].vertical = vertical;
+    g_vertical = vertical;
     for (auto& flipped : g_flipped) {
-        if (flipped.rootIndex == rootIndex && flipped.element.get()) {
-            SetScaleAxis(flipped.scale, vertical);
-        }
+        SetScaleAxis(flipped.scale);
     }
 }
 
-// The root is the closest element that contains both frames.
-void TryCreateRoots() {
+// The root is the closest element containing both frames. Secondary taskbars
+// have no tray frame, so only the main taskbar gets one.
+void TryCreateRoot() {
+    auto trayFrame = g_trayFrame.get();
+    if (g_root.get() || !trayFrame) {
+        return;
+    }
+
     for (const auto& weakTaskbarFrame : g_taskbarFrames) {
         auto taskbarFrame = weakTaskbarFrame.get();
-        if (!taskbarFrame || FindRootIndex(taskbarFrame) != -1) {
+        if (!taskbarFrame) {
             continue;
         }
 
-        for (const auto& weakTrayFrame : g_trayFrames) {
-            auto trayFrame = weakTrayFrame.get();
-            if (!trayFrame) {
-                continue;
-            }
-
-            wux::DependencyObject ancestor = GetParent(taskbarFrame);
-            while (ancestor && !IsAncestorOf(ancestor, trayFrame)) {
-                ancestor = GetParent(ancestor);
-            }
-
-            auto root = ancestor.try_as<wux::FrameworkElement>();
-            if (!root) {
-                continue;
-            }
-
-            Wh_Log(L"Mirroring taskbar, root %s",
-                   winrt::get_class_name(root).c_str());
-
-            size_t rootIndex = g_roots.size();
-            MirrorRoot mirrorRoot;
-            mirrorRoot.element = winrt::make_weak(root);
-            mirrorRoot.taskbarFrame = winrt::make_weak(taskbarFrame);
-            mirrorRoot.trayFrame = winrt::make_weak(trayFrame);
-            mirrorRoot.vertical = IsVertical(root);
-            mirrorRoot.sizeChangedToken = root.SizeChanged(
-                [rootIndex](const wf::IInspectable&,
-                            const wux::SizeChangedEventArgs&) {
-                    OnRootSizeChanged(rootIndex);
-                });
-            g_roots.push_back(std::move(mirrorRoot));
-
-            Flip(root, rootIndex);
-            FlipTrayIcons(trayFrame, rootIndex);
-            FlipTaskbarButtons(rootIndex);
-            break;
+        auto ancestor = GetParent(taskbarFrame);
+        while (ancestor && !IsAncestorOf(ancestor, trayFrame)) {
+            ancestor = GetParent(ancestor);
         }
+
+        auto root = ancestor.try_as<wux::FrameworkElement>();
+        if (!root) {
+            continue;
+        }
+
+        g_root = winrt::make_weak(root);
+        g_vertical = root.ActualHeight() > root.ActualWidth();
+        g_rootSizeChangedToken = root.SizeChanged(
+            [](const wf::IInspectable&, const wux::SizeChangedEventArgs&) {
+                OnRootSizeChanged();
+            });
+
+        Flip(root);
+        FlipDescendants(root);
+        g_taskbarFrames.clear();
+        return;
     }
 }
 
+// Elements keep being created over time, e.g. a button for each new app.
 void OnElementAdded(const wux::FrameworkElement& element,
-                    const wux::FrameworkElement& parent,
+                    const wux::DependencyObject& parent,
                     std::wstring_view type) {
     if (type == L"Taskbar.TaskbarFrame") {
         g_taskbarFrames.push_back(winrt::make_weak(element));
-        TryCreateRoots();
-        return;
-    }
-
-    if (type == L"SystemTray.SystemTrayFrame") {
-        g_trayFrames.push_back(winrt::make_weak(element));
-        TryCreateRoots();
-        return;
-    }
-
-    // Taskbar buttons (Start, search, apps) are created and recycled by the
-    // repeater over time.
-    if (parent && parent.Name() == L"TaskbarFrameRepeater") {
-        int rootIndex = FindRootIndex(parent);
-        if (rootIndex != -1) {
-            Flip(element, rootIndex);
-        }
-        return;
-    }
-
-    if (IsTrayIconType(type)) {
-        int rootIndex = FindRootIndex(element);
-        if (rootIndex == -1) {
-            return;
-        }
-
-        auto trayFrame = g_roots[rootIndex].trayFrame.get();
-        auto root = g_roots[rootIndex].element.get();
-        if (trayFrame && IsAncestorOf(trayFrame, element) &&
-            !HasFlippedAncestor(element, root)) {
-            Flip(element, rootIndex);
-        }
+        TryCreateRoot();
+    } else if (type == L"SystemTray.SystemTrayFrame") {
+        g_trayFrame = winrt::make_weak(element);
+        TryCreateRoot();
+    } else if (g_root.get() && parent && ShouldFlip(element, parent, type)) {
+        Flip(element);
     }
 }
 
-void RestoreAll() {
-    for (auto& flipped : g_flipped) {
+void RestoreTaskbar() {
+    for (const auto& flipped : g_flipped) {
         Unflip(flipped);
     }
     g_flipped.clear();
 
-    for (auto& root : g_roots) {
-        if (auto element = root.element.get()) {
-            element.SizeChanged(root.sizeChangedToken);
-        }
+    if (auto root = g_root.get()) {
+        root.SizeChanged(g_rootSizeChangedToken);
     }
-    g_roots.clear();
+    g_root = nullptr;
+    g_trayFrame = nullptr;
     g_taskbarFrames.clear();
-    g_trayFrames.clear();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// XAML diagnostics: gets a callback for every element in explorer's XAML trees.
+// XAML diagnostics: reports every element added to explorer's XAML trees.
 
 HMODULE GetCurrentModuleHandle() {
     HMODULE module;
@@ -404,9 +316,9 @@ HMODULE GetCurrentModuleHandle() {
 }
 
 // The XAML composition diagnostics corrupt the heap when several UI threads add
-// visuals at once. Only element mutations are needed, so the composition
-// diagnostics are turned off by answering the single registry read which
-// AdviseVisualTreeChange makes for DisableCompositionDiag.
+// visuals at once. Only element changes are needed, so they're turned off by
+// answering the one registry read AdviseVisualTreeChange makes for
+// DisableCompositionDiag.
 thread_local bool g_reportCompositionDiagAsDisabled;
 
 class VisualTreeWatcher
@@ -416,8 +328,7 @@ class VisualTreeWatcher
    public:
     explicit VisualTreeWatcher(winrt::com_ptr<IUnknown> site)
         : m_xamlDiagnostics(site.as<IXamlDiagnostics>()) {
-        // Advising from the calling thread can hang, so it's done from a new
-        // thread.
+        // Advising from the calling thread can hang.
         HANDLE thread = CreateThread(
             nullptr, 0,
             [](LPVOID param) -> DWORD {
@@ -449,23 +360,17 @@ class VisualTreeWatcher
     OnVisualTreeChange(ParentChildRelation relation,
                        VisualElement element,
                        VisualMutationType mutationType) noexcept override try {
-        if (mutationType != Add) {
-            return S_OK;
+        if (mutationType == Add) {
+            if (auto fe = FromHandle(element.Handle)
+                              .try_as<wux::FrameworkElement>()) {
+                wux::DependencyObject parent{nullptr};
+                if (relation.Parent) {
+                    parent = FromHandle(relation.Parent)
+                                 .try_as<wux::DependencyObject>();
+                }
+                OnElementAdded(fe, parent, element.Type ? element.Type : L"");
+            }
         }
-
-        auto frameworkElement =
-            FromHandle(element.Handle).try_as<wux::FrameworkElement>();
-        if (!frameworkElement) {
-            return S_OK;
-        }
-
-        wux::FrameworkElement parent{nullptr};
-        if (relation.Parent) {
-            parent = FromHandle(relation.Parent).try_as<wux::FrameworkElement>();
-        }
-
-        OnElementAdded(frameworkElement, parent,
-                       element.Type ? element.Type : L"");
         return S_OK;
     } catch (...) {
         Wh_Log(L"Error %08X", winrt::to_hresult());
@@ -584,7 +489,6 @@ void InjectWindhawkTAP() {
                   GetProcAddress(wux, "InitializeXamlDiagnosticsEx"))
             : nullptr;
     if (!initializeXamlDiagnosticsEx) {
-        Wh_Log(L"InitializeXamlDiagnosticsEx not found");
         return;
     }
 
@@ -601,11 +505,10 @@ void InjectWindhawkTAP() {
             break;
         }
     }
-    Wh_Log(L"InitializeXamlDiagnosticsEx: %08X", hr);
+    if (FAILED(hr)) {
+        Wh_Log(L"InitializeXamlDiagnosticsEx failed: %08X", hr);
+    }
 }
-
-////////////////////////////////////////////////////////////////////////////////
-// Hooks.
 
 using RegOpenKeyExW_t = decltype(&RegOpenKeyExW);
 RegOpenKeyExW_t RegOpenKeyExW_Original;
@@ -659,17 +562,19 @@ LSTATUS WINAPI RegQueryValueExW_Hook(HKEY key,
     return ERROR_SUCCESS;
 }
 
-bool IsTaskbarXamlHost(HWND hwnd, HWND parent) {
-    WCHAR className[64];
-    return parent &&
-           GetClassName(hwnd, className, ARRAYSIZE(className)) &&
-           _wcsicmp(className,
-                    L"Windows.UI.Composition.DesktopWindowContentBridge") == 0 &&
-           GetClassName(parent, className, ARRAYSIZE(className)) &&
-           _wcsicmp(className, L"Shell_TrayWnd") == 0;
+HWND FindTaskbarXamlHost() {
+    HWND taskbar = FindWindow(L"Shell_TrayWnd", nullptr);
+    DWORD processId = 0;
+    if (!taskbar || !GetWindowThreadProcessId(taskbar, &processId) ||
+        processId != GetCurrentProcessId()) {
+        return nullptr;
+    }
+    return FindWindowEx(taskbar, nullptr,
+                        L"Windows.UI.Composition.DesktopWindowContentBridge",
+                        nullptr);
 }
 
-// Picks up the taskbar when explorer starts with the mod already enabled.
+// Catches the taskbar being created when explorer starts with the mod enabled.
 using CreateWindowExW_t = decltype(&CreateWindowExW);
 CreateWindowExW_t CreateWindowExW_Original;
 HWND WINAPI CreateWindowExW_Hook(DWORD exStyle,
@@ -687,91 +592,28 @@ HWND WINAPI CreateWindowExW_Hook(DWORD exStyle,
     HWND hwnd = CreateWindowExW_Original(exStyle, className, windowName, style,
                                          x, y, width, height, parent, menu,
                                          instance, param);
-    if (hwnd && IsTaskbarXamlHost(hwnd, parent)) {
-        Wh_Log(L"Taskbar XAML host created");
+    WCHAR parentClass[32];
+    if (hwnd && parent &&
+        GetClassName(parent, parentClass, ARRAYSIZE(parentClass)) &&
+        _wcsicmp(parentClass, L"Shell_TrayWnd") == 0 &&
+        FindTaskbarXamlHost() == hwnd) {
         InjectWindhawkTAP();
     }
     return hwnd;
 }
 
-HWND FindTaskbarXamlHost() {
-    HWND taskbar = FindWindow(L"Shell_TrayWnd", nullptr);
-    DWORD processId = 0;
-    if (!taskbar || !GetWindowThreadProcessId(taskbar, &processId) ||
-        processId != GetCurrentProcessId()) {
-        return nullptr;
-    }
-    return FindWindowEx(taskbar, nullptr,
-                        L"Windows.UI.Composition.DesktopWindowContentBridge",
-                        nullptr);
-}
-
-using RunFromWindowThreadProc_t = void (*)(PVOID);
-
-struct RunFromWindowThreadParam {
-    RunFromWindowThreadProc_t proc;
-    PVOID procParam;
-};
-
-UINT g_runFromWindowThreadMsg;
-
-LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION) {
-        auto* msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
-        if (msg->message == g_runFromWindowThreadMsg) {
-            auto* param = reinterpret_cast<RunFromWindowThreadParam*>(msg->lParam);
-            param->proc(param->procParam);
-        }
-    }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
-}
-
-bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc_t proc, PVOID param) {
-    if (!g_runFromWindowThreadMsg) {
-        g_runFromWindowThreadMsg =
-            RegisterWindowMessage(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
-    }
-
-    DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
-    if (!threadId) {
-        return false;
-    }
-    if (threadId == GetCurrentThreadId()) {
-        proc(param);
-        return true;
-    }
-
-    HHOOK hook = SetWindowsHookEx(WH_CALLWNDPROC, RunFromWindowThreadHook,
-                                  nullptr, threadId);
-    if (!hook) {
-        return false;
-    }
-
-    RunFromWindowThreadParam data{proc, param};
-    SendMessage(hwnd, g_runFromWindowThreadMsg, 0, (LPARAM)&data);
-    UnhookWindowsHookEx(hook);
-    return true;
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Tray flyouts (hidden icons, quick settings, notification center).
 //
-// Windows still positions them for where the tray was. The tray is now on the
-// other half of the taskbar, so a flyout which would open on the far half is
-// mirrored across the taskbar's middle, which puts it next to the tray again.
-// Mirroring only when it's on the far half keeps repeated moves stable.
+// Windows still places them for where the tray was. The tray is now on the
+// other half of the taskbar, so a flyout on the far half is mirrored across the
+// taskbar's middle, putting it next to the tray again. Only mirroring flyouts
+// on the far half makes this safe to apply every time a flyout moves or shows.
 
-std::atomic<bool> g_unloading;
-
-bool GetTaskbarRect(RECT* rect) {
-    HWND taskbar = FindWindow(L"Shell_TrayWnd", nullptr);
-    return taskbar && GetWindowRect(taskbar, rect);
-}
-
-std::wstring GetThreadDescriptionOf(DWORD threadId) {
+std::wstring GetThreadDescriptionOf(HWND hwnd) {
     std::wstring result;
-    HANDLE thread =
-        OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId);
+    HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+                               GetWindowThreadProcessId(hwnd, nullptr));
     if (thread) {
         PWSTR description;
         if (SUCCEEDED(GetThreadDescription(thread, &description))) {
@@ -783,101 +625,46 @@ std::wstring GetThreadDescriptionOf(DWORD threadId) {
     return result;
 }
 
-// explorer: the taskbar itself. startMenu: StartMenuExperienceHost.exe.
-// shellFlyouts: ShellHost.exe and ShellExperienceHost.exe. app: any other
-// included process, such as tray apps like EarTrumpet.
-enum class Target { explorer, startMenu, shellFlyouts, app };
-Target g_target;
-
-enum class FlyoutKind {
-    none,
-    // Always belongs next to the tray.
-    tray,
-    // A generic explorer popup, also used for app thumbnails and Alt+Tab. Only
-    // treated as a tray flyout when the tray area was just clicked.
-    trayIfClicked,
-    // A tray app's popup. Treated as a tray flyout when it sits against the
-    // taskbar.
-    trayIfTouchingTaskbar,
-};
-
-FlyoutKind GetFlyoutKind(HWND hwnd) {
-    if (g_target == Target::app) {
-        bool topLevel = !(GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD) &&
-                        GetAncestor(hwnd, GA_PARENT) == GetDesktopWindow();
-        return topLevel ? FlyoutKind::trayIfTouchingTaskbar : FlyoutKind::none;
-    }
-
+bool IsTrayFlyout(HWND hwnd, const RECT& taskbar, bool vertical, int middle) {
     WCHAR className[64];
     if (!GetClassName(hwnd, className, ARRAYSIZE(className))) {
-        return FlyoutKind::none;
+        return false;
     }
 
     if (_wcsicmp(className, L"TopLevelWindowForOverflowXamlIsland") == 0 ||
         _wcsicmp(className, L"ControlCenterWindow") == 0) {
-        return FlyoutKind::tray;
+        return true;
     }
 
+    // Explorer also uses this class for app thumbnails and Alt+Tab, so it
+    // only counts when the tray's half of the taskbar was just clicked.
     if (_wcsicmp(className, L"XamlExplorerHostIslandWindow") == 0) {
-        return FlyoutKind::trayIfClicked;
-    }
-
-    // Jump lists are core windows too, and they belong next to their app, so
-    // only the tray's core windows are picked by their thread.
-    if (_wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
-        DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
-        std::wstring description = GetThreadDescriptionOf(threadId);
-        if (description == L"ActionCenter" || description == L"QuickActions") {
-            return FlyoutKind::tray;
-        }
-    }
-
-    return FlyoutKind::none;
-}
-
-void AdjustFlyoutPos(HWND hwnd, int& x, int& y, int cx, int cy) {
-    if (g_unloading) {
-        return;
-    }
-
-    FlyoutKind kind = GetFlyoutKind(hwnd);
-    if (kind == FlyoutKind::none) {
-        return;
-    }
-
-    RECT taskbar;
-    if (!GetTaskbarRect(&taskbar)) {
-        return;
-    }
-
-    bool vertical =
-        taskbar.bottom - taskbar.top > taskbar.right - taskbar.left;
-    int middle = vertical ? (taskbar.top + taskbar.bottom) / 2
-                          : (taskbar.left + taskbar.right) / 2;
-
-    if (kind == FlyoutKind::trayIfClicked) {
         DWORD messagePos = GetMessagePos();
         POINT pt{GET_X_LPARAM(messagePos), GET_Y_LPARAM(messagePos)};
-        bool clickedTrayHalf = PtInRect(&taskbar, pt) &&
-                               (vertical ? pt.y < middle : pt.x < middle);
-        if (!clickedTrayHalf) {
-            return;
-        }
+        return PtInRect(&taskbar, pt) &&
+               (vertical ? pt.y < middle : pt.x < middle);
     }
 
-    if (kind == FlyoutKind::trayIfTouchingTaskbar) {
-        // Gap between the window and the taskbar, across the taskbar.
-        int gap = vertical
-                      ? std::max<int>(taskbar.left - (x + cx), x - taskbar.right)
-                      : std::max<int>(taskbar.top - (y + cy), y - taskbar.bottom);
-        int maxGap = MulDiv(48, GetDpiForWindow(hwnd), 96);
-        if (gap > maxGap || cx <= 0 || cy <= 0) {
-            return;
-        }
+    // Jump lists are core windows too, so the tray's are told apart by thread.
+    if (_wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
+        std::wstring description = GetThreadDescriptionOf(hwnd);
+        return description == L"ActionCenter" || description == L"QuickActions";
     }
 
+    return false;
+}
+
+void MirrorFlyout(HWND hwnd, int& x, int& y, int cx, int cy) {
+    RECT taskbar;
+    if (g_unloading || !GetTaskbarRect(&taskbar)) {
+        return;
+    }
+
+    bool vertical = taskbar.bottom - taskbar.top > taskbar.right - taskbar.left;
+    int middle = vertical ? (taskbar.top + taskbar.bottom) / 2
+                          : (taskbar.left + taskbar.right) / 2;
     int center = vertical ? y + cy / 2 : x + cx / 2;
-    if (center <= middle) {
+    if (center <= middle || !IsTrayFlyout(hwnd, taskbar, vertical, middle)) {
         return;
     }
 
@@ -886,32 +673,10 @@ void AdjustFlyoutPos(HWND hwnd, int& x, int& y, int cx, int cy) {
     } else {
         x = taskbar.left + taskbar.right - x - cx;
     }
-
-    WCHAR className[64]{};
-    GetClassName(hwnd, className, ARRAYSIZE(className));
-    Wh_Log(L"Moved flyout %p (%s) to %d,%d", hwnd, className, x, y);
 }
 
 using SetWindowPos_t = decltype(&SetWindowPos);
 SetWindowPos_t SetWindowPos_Original;
-
-// For windows which were positioned earlier and are only being shown now.
-void AdjustCurrentPos(HWND hwnd) {
-    RECT rect;
-    if (!GetWindowRect(hwnd, &rect)) {
-        return;
-    }
-
-    int x = rect.left;
-    int y = rect.top;
-    AdjustFlyoutPos(hwnd, x, y, rect.right - rect.left,
-                    rect.bottom - rect.top);
-    if (x != rect.left || y != rect.top) {
-        SetWindowPos_Original(hwnd, nullptr, x, y, 0, 0,
-                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
 BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
                               HWND insertAfter,
                               int x,
@@ -919,59 +684,49 @@ BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
                               int cx,
                               int cy,
                               UINT flags) {
-    if ((flags & SWP_NOMOVE) && (flags & SWP_SHOWWINDOW) &&
-        g_target != Target::explorer) {
+    if (!(flags & SWP_NOMOVE) || (flags & SWP_SHOWWINDOW)) {
         RECT rect{};
         GetWindowRect(hwnd, &rect);
-        int newX = rect.left;
-        int newY = rect.top;
-        int width = (flags & SWP_NOSIZE) ? rect.right - rect.left : cx;
-        int height = (flags & SWP_NOSIZE) ? rect.bottom - rect.top : cy;
-        AdjustFlyoutPos(hwnd, newX, newY, width, height);
-        if (newX != rect.left || newY != rect.top) {
+        int newX = (flags & SWP_NOMOVE) ? rect.left : x;
+        int newY = (flags & SWP_NOMOVE) ? rect.top : y;
+        MirrorFlyout(hwnd, newX, newY,
+                     (flags & SWP_NOSIZE) ? rect.right - rect.left : cx,
+                     (flags & SWP_NOSIZE) ? rect.bottom - rect.top : cy);
+        if (!(flags & SWP_NOMOVE) || newX != rect.left || newY != rect.top) {
             x = newX;
             y = newY;
             flags &= ~SWP_NOMOVE;
         }
-    } else if (!(flags & SWP_NOMOVE)) {
-        int width = cx;
-        int height = cy;
-        if (flags & SWP_NOSIZE) {
-            RECT rect{};
-            GetWindowRect(hwnd, &rect);
-            width = rect.right - rect.left;
-            height = rect.bottom - rect.top;
-        }
-        AdjustFlyoutPos(hwnd, x, y, width, height);
     }
     return SetWindowPos_Original(hwnd, insertAfter, x, y, cx, cy, flags);
 }
 
-using MoveWindow_t = decltype(&MoveWindow);
-MoveWindow_t MoveWindow_Original;
-BOOL WINAPI MoveWindow_Hook(HWND hwnd,
-                            int x,
-                            int y,
-                            int width,
-                            int height,
-                            BOOL repaint) {
-    AdjustFlyoutPos(hwnd, x, y, width, height);
-    return MoveWindow_Original(hwnd, x, y, width, height, repaint);
+// For flyouts positioned earlier and only being shown now.
+void MirrorCurrentPos(HWND hwnd) {
+    RECT rect;
+    if (!GetWindowRect(hwnd, &rect)) {
+        return;
+    }
+
+    int x = rect.left;
+    int y = rect.top;
+    MirrorFlyout(hwnd, x, y, rect.right - rect.left, rect.bottom - rect.top);
+    if (x != rect.left || y != rect.top) {
+        SetWindowPos_Original(hwnd, nullptr, x, y, 0, 0,
+                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 using ShowWindow_t = decltype(&ShowWindow);
 ShowWindow_t ShowWindow_Original;
 BOOL WINAPI ShowWindow_Hook(HWND hwnd, int cmdShow) {
-    if (cmdShow != SW_HIDE && cmdShow != SW_MINIMIZE &&
-        cmdShow != SW_SHOWMINIMIZED && cmdShow != SW_SHOWMINNOACTIVE &&
-        cmdShow != SW_FORCEMINIMIZE) {
-        AdjustCurrentPos(hwnd);
+    if (cmdShow != SW_HIDE) {
+        MirrorCurrentPos(hwnd);
     }
     return ShowWindow_Original(hwnd, cmdShow);
 }
 
-// Shell flyouts are kept alive and hidden by cloaking, so uncloaking is when
-// they're shown.
+// Shell flyouts are kept alive and hidden by cloaking.
 using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
 DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
 HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
@@ -980,82 +735,222 @@ HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
                                           DWORD size) {
     if (attribute == DWMWA_CLOAK && size == sizeof(BOOL) && value &&
         !*static_cast<const BOOL*>(value)) {
-        AdjustCurrentPos(hwnd);
+        MirrorCurrentPos(hwnd);
     }
     return DwmSetWindowAttribute_Original(hwnd, attribute, value, size);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Start menu (runs in StartMenuExperienceHost.exe).
+// Start menu (StartMenuExperienceHost.exe).
 //
-// The Start menu window covers the whole monitor, and the menu is placed inside
-// it with XAML, so it's moved there. The value Windows picked is mirrored:
-// top-aligned becomes bottom-aligned, left becomes right.
+// The Start menu window covers the whole monitor and the menu is placed inside
+// it with XAML, so the menu's placement is mirrored there. Windows sets it again
+// whenever the menu opens, so it's mirrored again whenever it changes. The
+// value last set here tells the two apart, and since mirroring twice gives the
+// original back, restoring is mirroring once more.
 
 namespace StartMenu {
 
-template <typename T>
-class PropertyOverride {
-   public:
-    using PropertyGetter = wux::DependencyProperty (*)();
-
-    explicit PropertyOverride(PropertyGetter property) : m_property(property) {}
-
-    // The value Windows set, as opposed to the one set here.
-    std::optional<T> WindowsValue(const wux::DependencyObject& element) {
-        auto local = element.ReadLocalValue(m_property()).try_as<T>();
-        if (m_element.get() == element && local == m_value) {
-            return m_windowsValue;
-        }
-        return local;
-    }
-
-    void Set(const wux::DependencyObject& element, T value) {
-        auto local = element.ReadLocalValue(m_property()).try_as<T>();
-        if (m_element.get() != element || local != m_value) {
-            m_element = winrt::make_weak(element);
-            m_windowsValue = local;
-        }
-        m_value = value;
-        element.SetValue(m_property(), winrt::box_value(value));
-    }
-
-    void Restore() {
-        auto element = m_element.get();
-        m_element = nullptr;
-        if (!element ||
-            element.ReadLocalValue(m_property()).try_as<T>() != m_value) {
-            return;
-        }
-        if (m_windowsValue) {
-            element.SetValue(m_property(), winrt::box_value(*m_windowsValue));
-        } else {
-            element.ClearValue(m_property());
-        }
-    }
-
-   private:
-    PropertyGetter m_property;
-    winrt::weak_ref<wux::DependencyObject> m_element;
-    std::optional<T> m_windowsValue;
-    T m_value{};
+// The redesigned menu is aligned inside FrameRoot, the older one is positioned
+// on a canvas.
+struct State {
+    winrt::weak_ref<wux::FrameworkElement> element;
+    bool vertical = false;
+    std::optional<wux::VerticalAlignment> verticalAlignment;
+    std::optional<wux::HorizontalAlignment> horizontalAlignment;
+    std::optional<wux::Thickness> margin;
+    std::optional<double> canvasTop;
+    std::optional<double> canvasLeft;
+    std::vector<std::pair<wux::DependencyProperty, int64_t>> watchTokens;
 };
 
-PropertyOverride<double> g_canvasTop{&wux::Controls::Canvas::TopProperty};
-PropertyOverride<double> g_canvasLeft{&wux::Controls::Canvas::LeftProperty};
-PropertyOverride<wux::VerticalAlignment> g_verticalAlignment{
-    &wux::FrameworkElement::VerticalAlignmentProperty};
-PropertyOverride<wux::HorizontalAlignment> g_horizontalAlignment{
-    &wux::FrameworkElement::HorizontalAlignmentProperty};
-PropertyOverride<wux::Thickness> g_margin{
-    &wux::FrameworkElement::MarginProperty};
-
+State g_state;
 winrt::event_token g_visibilityChangedToken;
-winrt::weak_ref<wux::DependencyObject> g_watchedElement;
-std::vector<std::pair<wux::DependencyProperty, int64_t>> g_watchTokens;
-bool g_inApply;
+bool g_applying;
+
+template <typename T, typename Mirror>
+void MirrorProperty(const wux::FrameworkElement& element,
+                    const wux::DependencyProperty& property,
+                    std::optional<T>& lastSet,
+                    Mirror mirror) {
+    T current = winrt::unbox_value<T>(element.GetValue(property));
+    if (lastSet && current == *lastSet) {
+        return;
+    }
+    lastSet = mirror(current);
+    element.SetValue(property, winrt::box_value(*lastSet));
+}
+
+template <typename T, typename Mirror>
+void UnmirrorProperty(const wux::FrameworkElement& element,
+                      const wux::DependencyProperty& property,
+                      std::optional<T>& lastSet,
+                      Mirror mirror) {
+    if (lastSet &&
+        winrt::unbox_value<T>(element.GetValue(property)) == *lastSet) {
+        element.SetValue(property, winrt::box_value(mirror(*lastSet)));
+    }
+    lastSet.reset();
+}
+
+wux::VerticalAlignment MirrorAlignment(wux::VerticalAlignment a) {
+    return a == wux::VerticalAlignment::Top      ? wux::VerticalAlignment::Bottom
+           : a == wux::VerticalAlignment::Bottom ? wux::VerticalAlignment::Top
+                                                 : a;
+}
+
+wux::HorizontalAlignment MirrorAlignment(wux::HorizontalAlignment a) {
+    return a == wux::HorizontalAlignment::Left    ? wux::HorizontalAlignment::Right
+           : a == wux::HorizontalAlignment::Right ? wux::HorizontalAlignment::Left
+                                                  : a;
+}
+
+// Applies (or with undo, reverts) the mirroring of every property along the
+// given axis.
+void MirrorAll(const wux::FrameworkElement& element, bool vertical, bool undo) {
+    auto content = GetParent(element).try_as<wux::FrameworkElement>();
+    double contentHeight = content ? content.ActualHeight() : 0;
+    double contentWidth = content ? content.ActualWidth() : 0;
+
+    auto apply = [&](const wux::DependencyProperty& property, auto& lastSet,
+                     auto mirror) {
+        if (undo) {
+            UnmirrorProperty(element, property, lastSet, mirror);
+        } else {
+            MirrorProperty(element, property, lastSet, mirror);
+        }
+    };
+
+    auto& s = g_state;
+    if (content && content.try_as<wux::Controls::Canvas>()) {
+        if (vertical) {
+            apply(wux::Controls::Canvas::TopProperty(), s.canvasTop,
+                  [&](double top) {
+                      return contentHeight - element.ActualHeight() - top;
+                  });
+        } else {
+            apply(wux::Controls::Canvas::LeftProperty(), s.canvasLeft,
+                  [&](double left) {
+                      return contentWidth - element.ActualWidth() - left;
+                  });
+        }
+        return;
+    }
+
+    if (vertical) {
+        apply(wux::FrameworkElement::VerticalAlignmentProperty(),
+              s.verticalAlignment,
+              [](wux::VerticalAlignment a) { return MirrorAlignment(a); });
+    } else {
+        apply(wux::FrameworkElement::HorizontalAlignmentProperty(),
+              s.horizontalAlignment,
+              [](wux::HorizontalAlignment a) { return MirrorAlignment(a); });
+    }
+    apply(wux::FrameworkElement::MarginProperty(), s.margin,
+          [vertical](wux::Thickness t) {
+              if (vertical) {
+                  std::swap(t.Top, t.Bottom);
+              } else {
+                  std::swap(t.Left, t.Right);
+              }
+              return t;
+          });
+}
 
 void Apply();
+
+void Watch(const wux::FrameworkElement& element) {
+    for (auto property : {wux::FrameworkElement::VerticalAlignmentProperty(),
+                          wux::FrameworkElement::HorizontalAlignmentProperty(),
+                          wux::FrameworkElement::MarginProperty(),
+                          wux::Controls::Canvas::TopProperty(),
+                          wux::Controls::Canvas::LeftProperty()}) {
+        int64_t token = element.RegisterPropertyChangedCallback(
+            property,
+            [](const wux::DependencyObject&, const wux::DependencyProperty&) {
+                if (!g_applying) {
+                    Apply();
+                }
+            });
+        g_state.watchTokens.emplace_back(property, token);
+    }
+}
+
+void Restore() {
+    auto element = g_state.element.get();
+    if (element) {
+        MirrorAll(element, g_state.vertical, /*undo=*/true);
+        for (const auto& [property, token] : g_state.watchTokens) {
+            element.UnregisterPropertyChangedCallback(property, token);
+        }
+    }
+    g_state = {};
+}
+
+void Apply() try {
+    auto window = wux::Window::Current();
+    auto content = window ? window.Content() : nullptr;
+    if (!content) {
+        return;
+    }
+
+    auto element = FindDescendant(content, [](const wux::FrameworkElement& e) {
+        return e.Name() == L"FrameRoot" ||
+               winrt::get_class_name(e) == L"StartDocked.StartSizingFrame";
+    });
+    if (!element) {
+        Wh_Log(L"Start menu element not found");
+        return;
+    }
+
+    g_applying = true;
+
+    bool vertical = IsTaskbarVertical();
+    if (g_state.element.get() != element || g_state.vertical != vertical) {
+        Restore();
+        g_state.element = winrt::make_weak(element);
+        g_state.vertical = vertical;
+        Watch(element);
+    }
+    MirrorAll(element, vertical, /*undo=*/false);
+
+    g_applying = false;
+} catch (...) {
+    g_applying = false;
+    Wh_Log(L"Error %08X", winrt::to_hresult());
+}
+
+void Init() try {
+    auto window = wux::Window::Current();
+    if (g_visibilityChangedToken || !window) {
+        return;
+    }
+
+    g_visibilityChangedToken = window.VisibilityChanged(
+        [](const wf::IInspectable&,
+           const winrt::Windows::UI::Core::VisibilityChangedEventArgs& args) {
+            if (args.Visible()) {
+                Apply();
+            }
+        });
+    Apply();
+} catch (...) {
+    Wh_Log(L"Error %08X", winrt::to_hresult());
+}
+
+void Uninit() try {
+    if (g_visibilityChangedToken) {
+        if (auto window = wux::Window::Current()) {
+            window.VisibilityChanged(g_visibilityChangedToken);
+        }
+        g_visibilityChangedToken = {};
+    }
+    g_applying = true;
+    Restore();
+    g_applying = false;
+} catch (...) {
+    Wh_Log(L"Error %08X", winrt::to_hresult());
+}
 
 HWND FindCoreWindow() {
     HWND found = nullptr;
@@ -1074,198 +969,6 @@ HWND FindCoreWindow() {
         },
         reinterpret_cast<LPARAM>(&found));
     return found;
-}
-
-wux::FrameworkElement FindByClass(const wux::DependencyObject& element,
-                                  std::wstring_view className,
-                                  int depth = 0) {
-    if (depth > 12) {
-        return nullptr;
-    }
-
-    int count = wuxm::VisualTreeHelper::GetChildrenCount(element);
-    for (int i = 0; i < count; i++) {
-        auto child = wuxm::VisualTreeHelper::GetChild(element, i);
-        if (auto fe = child.try_as<wux::FrameworkElement>();
-            fe && winrt::get_class_name(fe) == className) {
-            return fe;
-        }
-        if (auto found = FindByClass(child, className, depth + 1)) {
-            return found;
-        }
-    }
-    return nullptr;
-}
-
-// Windows resets the position when the menu opens or the monitor changes, so
-// the mirrored value is put back whenever that happens.
-void Watch(const wux::DependencyObject& element,
-           std::initializer_list<wux::DependencyProperty> properties) {
-    if (g_watchedElement.get() == element) {
-        return;
-    }
-
-    g_watchedElement = winrt::make_weak(element);
-    for (const auto& property : properties) {
-        int64_t token = element.RegisterPropertyChangedCallback(
-            property, [](const wux::DependencyObject&,
-                         const wux::DependencyProperty&) {
-                if (!g_inApply) {
-                    Apply();
-                }
-            });
-        g_watchTokens.emplace_back(property, token);
-    }
-}
-
-void Unwatch() {
-    if (auto element = g_watchedElement.get()) {
-        for (const auto& [property, token] : g_watchTokens) {
-            element.UnregisterPropertyChangedCallback(property, token);
-        }
-    }
-    g_watchTokens.clear();
-    g_watchedElement = nullptr;
-}
-
-bool IsTaskbarVertical() {
-    RECT taskbar;
-    return GetTaskbarRect(&taskbar) &&
-           taskbar.bottom - taskbar.top > taskbar.right - taskbar.left;
-}
-
-// Older Start menu: the menu sits on a canvas at Canvas.Top/Canvas.Left.
-void ApplyCanvas(const wux::FrameworkElement& content, bool vertical) {
-    auto frame = FindByClass(content, L"StartDocked.StartSizingFrame");
-    if (!frame) {
-        Wh_Log(L"StartDocked.StartSizingFrame not found");
-        return;
-    }
-
-    if (vertical) {
-        double windowsTop = g_canvasTop.WindowsValue(frame).value_or(0);
-        g_canvasTop.Set(frame, content.ActualHeight() - frame.ActualHeight() -
-                                   windowsTop);
-    } else {
-        double windowsLeft = g_canvasLeft.WindowsValue(frame).value_or(0);
-        g_canvasLeft.Set(frame, content.ActualWidth() - frame.ActualWidth() -
-                                    windowsLeft);
-    }
-
-    Watch(frame, {wux::Controls::Canvas::TopProperty(),
-                  wux::Controls::Canvas::LeftProperty()});
-}
-
-// Redesigned Start menu: the menu is aligned inside its root.
-void ApplyAligned(const wux::FrameworkElement& content, bool vertical) {
-    auto frameRoot = FindByName(content, L"FrameRoot");
-    if (!frameRoot) {
-        Wh_Log(L"FrameRoot not found");
-        return;
-    }
-
-    auto margin = g_margin.WindowsValue(frameRoot).value_or(frameRoot.Margin());
-    if (vertical) {
-        auto alignment = g_verticalAlignment.WindowsValue(frameRoot).value_or(
-            frameRoot.VerticalAlignment());
-        if (alignment == wux::VerticalAlignment::Top) {
-            alignment = wux::VerticalAlignment::Bottom;
-        } else if (alignment == wux::VerticalAlignment::Bottom) {
-            alignment = wux::VerticalAlignment::Top;
-        }
-        std::swap(margin.Top, margin.Bottom);
-        g_verticalAlignment.Set(frameRoot, alignment);
-    } else {
-        auto alignment = g_horizontalAlignment.WindowsValue(frameRoot).value_or(
-            frameRoot.HorizontalAlignment());
-        if (alignment == wux::HorizontalAlignment::Left) {
-            alignment = wux::HorizontalAlignment::Right;
-        } else if (alignment == wux::HorizontalAlignment::Right) {
-            alignment = wux::HorizontalAlignment::Left;
-        }
-        std::swap(margin.Left, margin.Right);
-        g_horizontalAlignment.Set(frameRoot, alignment);
-    }
-    g_margin.Set(frameRoot, margin);
-
-    Watch(frameRoot, {wux::FrameworkElement::VerticalAlignmentProperty(),
-                      wux::FrameworkElement::HorizontalAlignmentProperty(),
-                      wux::FrameworkElement::MarginProperty()});
-}
-
-void RestoreAll() {
-    g_canvasTop.Restore();
-    g_canvasLeft.Restore();
-    g_verticalAlignment.Restore();
-    g_horizontalAlignment.Restore();
-    g_margin.Restore();
-}
-
-void Apply() try {
-    auto window = wux::Window::Current();
-    auto content = window ? window.Content().try_as<wux::FrameworkElement>()
-                          : nullptr;
-    if (!content) {
-        return;
-    }
-
-    g_inApply = true;
-
-    // Restore first, so that the Windows values are read fresh and switching
-    // the taskbar between vertical and horizontal doesn't mirror twice.
-    RestoreAll();
-
-    if (!g_unloading) {
-        auto className = winrt::get_class_name(content);
-        bool vertical = IsTaskbarVertical();
-        Wh_Log(L"Start menu content %s, vertical %d", className.c_str(),
-               vertical);
-        if (className == L"Windows.UI.Xaml.Controls.Canvas") {
-            ApplyCanvas(content, vertical);
-        } else {
-            ApplyAligned(content, vertical);
-        }
-    }
-
-    g_inApply = false;
-} catch (...) {
-    g_inApply = false;
-    Wh_Log(L"Error %08X", winrt::to_hresult());
-}
-
-void Init() try {
-    if (g_visibilityChangedToken) {
-        return;
-    }
-
-    auto window = wux::Window::Current();
-    if (!window) {
-        return;
-    }
-
-    g_visibilityChangedToken = window.VisibilityChanged(
-        [](const wf::IInspectable&,
-           const winrt::Windows::UI::Core::VisibilityChangedEventArgs& args) {
-            if (args.Visible()) {
-                Apply();
-            }
-        });
-    Apply();
-} catch (...) {
-    Wh_Log(L"Error %08X", winrt::to_hresult());
-}
-
-void Uninit() try {
-    Unwatch();
-    if (g_visibilityChangedToken) {
-        if (auto window = wux::Window::Current()) {
-            window.VisibilityChanged(g_visibilityChangedToken);
-        }
-        g_visibilityChangedToken = {};
-    }
-    RestoreAll();
-} catch (...) {
-    Wh_Log(L"Error %08X", winrt::to_hresult());
 }
 
 // The Start menu's XAML is created on demand. Creating its island is the
@@ -1292,30 +995,68 @@ HRESULT WINAPI RoGetActivationFactory_Hook(HSTRING classId,
 ////////////////////////////////////////////////////////////////////////////////
 // Entry points.
 
-BOOL Wh_ModInit() {
-    Wh_Log(L">");
+using RunFromWindowThreadProc_t = void (*)(PVOID);
 
-    g_target = Target::app;
-    WCHAR path[MAX_PATH];
-    if (GetModuleFileName(nullptr, path, ARRAYSIZE(path))) {
-        PCWSTR name = wcsrchr(path, L'\\');
-        name = name ? name + 1 : path;
-        if (_wcsicmp(name, L"explorer.exe") == 0) {
-            g_target = Target::explorer;
-        } else if (_wcsicmp(name, L"StartMenuExperienceHost.exe") == 0) {
-            g_target = Target::startMenu;
-        } else if (_wcsicmp(name, L"ShellExperienceHost.exe") == 0 ||
-                   _wcsicmp(name, L"ShellHost.exe") == 0) {
-            g_target = Target::shellFlyouts;
+struct RunFromWindowThreadParam {
+    RunFromWindowThreadProc_t proc;
+    PVOID procParam;
+};
+
+UINT g_runFromWindowThreadMsg;
+
+LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION) {
+        auto* msg = reinterpret_cast<const CWPSTRUCT*>(lParam);
+        if (msg->message == g_runFromWindowThreadMsg) {
+            auto* param = reinterpret_cast<RunFromWindowThreadParam*>(msg->lParam);
+            param->proc(param->procParam);
         }
-        Wh_Log(L"Process %s, target %d", name, static_cast<int>(g_target));
     }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc_t proc) {
+    if (!g_runFromWindowThreadMsg) {
+        g_runFromWindowThreadMsg =
+            RegisterWindowMessage(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+    }
+
+    DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
+    if (!threadId) {
+        return;
+    }
+    if (threadId == GetCurrentThreadId()) {
+        proc(nullptr);
+        return;
+    }
+
+    HHOOK hook = SetWindowsHookEx(WH_CALLWNDPROC, RunFromWindowThreadHook,
+                                  nullptr, threadId);
+    if (hook) {
+        RunFromWindowThreadParam data{proc, nullptr};
+        SendMessage(hwnd, g_runFromWindowThreadMsg, 0, (LPARAM)&data);
+        UnhookWindowsHookEx(hook);
+    }
+}
+
+enum class Target { explorer, startMenu, shell };
+Target g_target;
+
+BOOL Wh_ModInit() {
+    WCHAR path[MAX_PATH]{};
+    GetModuleFileName(nullptr, path, ARRAYSIZE(path));
+    PCWSTR name = wcsrchr(path, L'\\');
+    name = name ? name + 1 : path;
+    g_target = _wcsicmp(name, L"explorer.exe") == 0 ? Target::explorer
+               : _wcsicmp(name, L"StartMenuExperienceHost.exe") == 0
+                   ? Target::startMenu
+                   : Target::shell;
 
     if (g_target == Target::startMenu) {
         HMODULE winrt = GetModuleHandle(L"api-ms-win-core-winrt-l1-1-0.dll");
         WindhawkUtils::SetFunctionHook(
-            (StartMenu::RoGetActivationFactory_t)GetProcAddress(winrt,
-                                                     "RoGetActivationFactory"),
+            (StartMenu::RoGetActivationFactory_t)GetProcAddress(
+                winrt, "RoGetActivationFactory"),
             StartMenu::RoGetActivationFactory_Hook,
             &StartMenu::RoGetActivationFactory_Original);
         return TRUE;
@@ -1323,79 +1064,55 @@ BOOL Wh_ModInit() {
 
     WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
                                    &SetWindowPos_Original);
-    WindhawkUtils::SetFunctionHook(MoveWindow, MoveWindow_Hook,
-                                   &MoveWindow_Original);
+    WindhawkUtils::SetFunctionHook(ShowWindow, ShowWindow_Hook,
+                                   &ShowWindow_Original);
+    HMODULE dwmapi =
+        LoadLibraryEx(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    WindhawkUtils::SetFunctionHook(
+        (DwmSetWindowAttribute_t)GetProcAddress(dwmapi,
+                                                "DwmSetWindowAttribute"),
+        DwmSetWindowAttribute_Hook, &DwmSetWindowAttribute_Original);
 
-    if (g_target != Target::explorer) {
-        WindhawkUtils::SetFunctionHook(ShowWindow, ShowWindow_Hook,
-                                       &ShowWindow_Original);
-
-        HMODULE dwmapi = LoadLibraryEx(L"dwmapi.dll", nullptr,
-                                       LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (auto pDwmSetWindowAttribute =
-                dwmapi ? (DwmSetWindowAttribute_t)GetProcAddress(
-                             dwmapi, "DwmSetWindowAttribute")
-                       : nullptr) {
-            WindhawkUtils::SetFunctionHook(pDwmSetWindowAttribute,
-                                           DwmSetWindowAttribute_Hook,
-                                           &DwmSetWindowAttribute_Original);
-        }
-        return TRUE;
+    if (g_target == Target::explorer) {
+        WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
+                                       &CreateWindowExW_Original);
+        HMODULE kernelBase = GetModuleHandle(L"kernelbase.dll");
+        WindhawkUtils::SetFunctionHook(
+            (RegOpenKeyExW_t)GetProcAddress(kernelBase, "RegOpenKeyExW"),
+            RegOpenKeyExW_Hook, &RegOpenKeyExW_Original);
+        WindhawkUtils::SetFunctionHook(
+            (RegQueryValueExW_t)GetProcAddress(kernelBase, "RegQueryValueExW"),
+            RegQueryValueExW_Hook, &RegQueryValueExW_Original);
     }
-
-    WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
-                                   &CreateWindowExW_Original);
-
-    HMODULE kernelBase = GetModuleHandle(L"kernelbase.dll");
-    WindhawkUtils::SetFunctionHook(
-        (RegOpenKeyExW_t)GetProcAddress(kernelBase, "RegOpenKeyExW"),
-        RegOpenKeyExW_Hook, &RegOpenKeyExW_Original);
-    WindhawkUtils::SetFunctionHook(
-        (RegQueryValueExW_t)GetProcAddress(kernelBase, "RegQueryValueExW"),
-        RegQueryValueExW_Hook, &RegQueryValueExW_Original);
 
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    Wh_Log(L">");
-
     if (g_target == Target::startMenu) {
         if (HWND coreWindow = StartMenu::FindCoreWindow()) {
-            RunFromWindowThread(
-                coreWindow, [](PVOID) { StartMenu::Init(); }, nullptr);
+            RunFromWindowThread(coreWindow, [](PVOID) { StartMenu::Init(); });
         }
-        return;
-    }
-
-    if (g_target == Target::explorer && FindTaskbarXamlHost()) {
+    } else if (g_target == Target::explorer && FindTaskbarXamlHost()) {
         InjectWindhawkTAP();
     }
 }
 
 void Wh_ModUninit() {
-    Wh_Log(L">");
-
     g_unloading = true;
 
     if (g_target == Target::startMenu) {
         if (HWND coreWindow = StartMenu::FindCoreWindow()) {
-            RunFromWindowThread(
-                coreWindow, [](PVOID) { StartMenu::Uninit(); }, nullptr);
+            RunFromWindowThread(coreWindow,
+                                [](PVOID) { StartMenu::Uninit(); });
         }
-        return;
-    }
-
-    if (g_target != Target::explorer) {
-        return;
-    }
-
-    if (g_visualTreeWatcher) {
-        g_visualTreeWatcher->Unadvise();
-        g_visualTreeWatcher = nullptr;
-    }
-
-    if (HWND host = FindTaskbarXamlHost()) {
-        RunFromWindowThread(host, [](PVOID) { RestoreAll(); }, nullptr);
+    } else if (g_target == Target::explorer) {
+        if (g_visualTreeWatcher) {
+            g_visualTreeWatcher->Unadvise();
+            g_visualTreeWatcher = nullptr;
+        }
+        if (HWND host = FindTaskbarXamlHost()) {
+            RunFromWindowThread(host, [](PVOID) { RestoreTaskbar(); });
+        }
     }
 }
