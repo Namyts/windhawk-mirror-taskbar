@@ -2,7 +2,7 @@
 // @id              taskbar-mirrored-layout
 // @name            Mirrored Taskbar Layout
 // @description     Reverses the taskbar order: on a left/right taskbar Start goes to the bottom, apps stack upwards from it, and the clock goes to the top
-// @version         3.0
+// @version         3.1
 // @author          namyts
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
@@ -24,14 +24,13 @@ any icons or text.
 * Top/bottom taskbar: Start on the right, clock and notification area on the
   left.
 
-The Start menu and the tray flyouts (hidden icons, quick settings, notification
-center) open on the matching side.
+The Start menu, quick settings, and the tray's hidden-icons flyout open on the
+matching side.
 */
 // ==/WindhawkModReadme==
 
 #include <windhawk_utils.h>
 
-#include <dwmapi.h>
 #include <roapi.h>
 #include <windowsx.h>
 #include <winstring.h>
@@ -54,6 +53,9 @@ center) open on the matching side.
 namespace wf = winrt::Windows::Foundation;
 namespace wux = winrt::Windows::UI::Xaml;
 namespace wuxm = winrt::Windows::UI::Xaml::Media;
+
+enum class Target { explorer, startMenu, shell };
+Target g_target;
 
 std::atomic<bool> g_unloading;
 
@@ -273,10 +275,145 @@ void TryCreateRoot() {
     }
 }
 
+// Quick settings (and the notification center) are a full-height window with
+// the panel aligned to the bottom, which is where the tray sits before
+// mirroring. The panel is pinned to the top instead. Windows sets the
+// alignment again whenever the panel opens, so it's put back each time.
+struct PinnedElement {
+    winrt::weak_ref<wux::FrameworkElement> element;
+    wux::VerticalAlignment alignment;
+    wux::VerticalAlignment original;
+    int64_t token{};
+};
+
+std::vector<PinnedElement> g_pinned;
+bool g_pinning;
+
+bool IsFlyoutPage(const wux::DependencyObject& element) {
+    auto name = winrt::get_class_name(element);
+    return name == L"ControlCenter.ControlCenterPage" ||
+           name == L"ActionCenter.NotificationCenterPage";
+}
+
+bool HasFlyoutPageAncestor(wux::DependencyObject node,
+                           const wux::DependencyObject& parent) {
+    // The parent link can be missing for an element that was just added.
+    if (parent && GetParent(node) != parent) {
+        node = parent;
+    }
+    for (; node; node = GetParent(node)) {
+        if (IsFlyoutPage(node)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Pin(const wux::FrameworkElement& element, wux::VerticalAlignment alignment) {
+    for (const auto& pinned : g_pinned) {
+        if (pinned.element.get() == element) {
+            if (element.VerticalAlignment() != alignment) {
+                g_pinning = true;
+                element.VerticalAlignment(alignment);
+                g_pinning = false;
+            }
+            return;
+        }
+    }
+
+    auto original = element.VerticalAlignment();
+    g_pinning = true;
+    element.VerticalAlignment(alignment);
+    g_pinning = false;
+
+    int64_t token = element.RegisterPropertyChangedCallback(
+        wux::FrameworkElement::VerticalAlignmentProperty(),
+        [](const wux::DependencyObject& sender, const wux::DependencyProperty&) {
+            if (g_pinning || g_unloading) {
+                return;
+            }
+            auto fe = sender.try_as<wux::FrameworkElement>();
+            for (const auto& pinned : g_pinned) {
+                if (fe && pinned.element.get() == fe &&
+                    fe.VerticalAlignment() != pinned.alignment) {
+                    g_pinning = true;
+                    fe.VerticalAlignment(pinned.alignment);
+                    g_pinning = false;
+                    break;
+                }
+            }
+        });
+    g_pinned.push_back({winrt::make_weak(element), alignment, original, token});
+    Wh_Log(L"Pinned %s / %s", winrt::get_class_name(element).c_str(),
+           element.Name().c_str());
+}
+
+void RestorePins() {
+    g_pinning = true;
+    for (const auto& pinned : g_pinned) {
+        auto element = pinned.element.get();
+        if (!element) {
+            continue;
+        }
+        element.UnregisterPropertyChangedCallback(
+            wux::FrameworkElement::VerticalAlignmentProperty(), pinned.token);
+        if (element.VerticalAlignment() == pinned.alignment) {
+            element.VerticalAlignment(pinned.original);
+        }
+    }
+    g_pinned.clear();
+    g_pinning = false;
+}
+
 // Elements keep being created over time, e.g. a button for each new app.
 void OnElementAdded(const wux::FrameworkElement& element,
                     const wux::DependencyObject& parent,
                     std::wstring_view type) {
+    if (g_target == Target::shell) {
+        if (!IsTaskbarVertical()) {
+            return;
+        }
+
+        // TEMPORARY: shows whether the quick settings page was found.
+        if (type.find(L"Control") != std::wstring_view::npos ||
+            type.find(L"Action") != std::wstring_view::npos ||
+            element.Name() == L"RootContent" || element.Name() == L"RootGrid") {
+            static int reported = 0;
+            if (reported < 40) {
+                reported++;
+                Wh_Log(L"Shell XAML %.*s name=%s valign=%d", (int)type.size(),
+                       type.data(), element.Name().c_str(),
+                       static_cast<int>(element.VerticalAlignment()));
+            }
+        }
+
+        auto pinPage = [](const wux::FrameworkElement& page) {
+            Pin(page, wux::VerticalAlignment::Stretch);
+            if (auto grid = FindDescendant(page, [](const wux::FrameworkElement& e) {
+                    return e.Name() == L"RootGrid";
+                })) {
+                Pin(grid, wux::VerticalAlignment::Stretch);
+            }
+            if (auto content = FindDescendant(
+                    page, [](const wux::FrameworkElement& e) {
+                        return e.Name() == L"RootContent";
+                    })) {
+                Pin(content, wux::VerticalAlignment::Top);
+            }
+        };
+
+        if (IsFlyoutPage(element)) {
+            pinPage(element);
+        } else if (element.Name() == L"RootGrid" &&
+                   HasFlyoutPageAncestor(element, parent)) {
+            Pin(element, wux::VerticalAlignment::Stretch);
+        } else if (element.Name() == L"RootContent" &&
+                   HasFlyoutPageAncestor(element, parent)) {
+            Pin(element, wux::VerticalAlignment::Top);
+        }
+        return;
+    }
+
     if (type == L"Taskbar.TaskbarFrame") {
         g_taskbarFrames.push_back(winrt::make_weak(element));
         TryCreateRoot();
@@ -303,7 +440,7 @@ void RestoreTaskbar() {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// XAML diagnostics: reports every element added to explorer's XAML trees.
+// XAML diagnostics: reports every element added to a process's XAML trees.
 
 HMODULE GetCurrentModuleHandle() {
     HMODULE module;
@@ -472,7 +609,7 @@ __declspec(dllexport) _Use_decl_annotations_ STDAPI DllCanUnloadNow() {
 std::atomic<bool> g_tapInjected;
 
 void InjectWindhawkTAP() {
-    if (g_tapInjected.exchange(true)) {
+    if (g_tapInjected.load()) {
         return;
     }
 
@@ -488,12 +625,13 @@ void InjectWindhawkTAP() {
         wux ? reinterpret_cast<decltype(&InitializeXamlDiagnosticsEx)>(
                   GetProcAddress(wux, "InitializeXamlDiagnosticsEx"))
             : nullptr;
-    if (!initializeXamlDiagnosticsEx) {
+    if (!initializeXamlDiagnosticsEx || g_tapInjected.exchange(true)) {
         return;
     }
 
     // There's no way to know which connection name is free, so try them in
-    // order.
+    // order. A failure leaves another attempt possible, since ShellHost's XAML
+    // may not exist yet the first time this runs.
     HRESULT hr = E_FAIL;
     for (int i = 1; i <= 10000; i++) {
         WCHAR connectionName[64];
@@ -506,6 +644,7 @@ void InjectWindhawkTAP() {
         }
     }
     if (FAILED(hr)) {
+        g_tapInjected = false;
         Wh_Log(L"InitializeXamlDiagnosticsEx failed: %08X", hr);
     }
 }
@@ -603,27 +742,10 @@ HWND WINAPI CreateWindowExW_Hook(DWORD exStyle,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Tray flyouts (hidden icons, quick settings, notification center).
-//
-// Windows still places them for where the tray was. The tray is now on the
-// other half of the taskbar, so a flyout on the far half is mirrored across the
-// taskbar's middle, putting it next to the tray again. Only mirroring flyouts
-// on the far half makes this safe to apply every time a flyout moves or shows.
-
-std::wstring GetThreadDescriptionOf(HWND hwnd) {
-    std::wstring result;
-    HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
-                               GetWindowThreadProcessId(hwnd, nullptr));
-    if (thread) {
-        PWSTR description;
-        if (SUCCEEDED(GetThreadDescription(thread, &description))) {
-            result = description;
-            LocalFree(description);
-        }
-        CloseHandle(thread);
-    }
-    return result;
-}
+// The hidden-icons flyout. Windows still places it for where the tray was, so
+// one that would open on the far half of the taskbar is mirrored across the
+// middle. Quick settings are not a movable window: they fill the screen height
+// and the panel inside them is moved instead, above.
 
 bool IsTrayFlyout(HWND hwnd, const RECT& taskbar, bool vertical, int middle) {
     WCHAR className[64];
@@ -631,8 +753,7 @@ bool IsTrayFlyout(HWND hwnd, const RECT& taskbar, bool vertical, int middle) {
         return false;
     }
 
-    if (_wcsicmp(className, L"TopLevelWindowForOverflowXamlIsland") == 0 ||
-        _wcsicmp(className, L"ControlCenterWindow") == 0) {
+    if (_wcsicmp(className, L"TopLevelWindowForOverflowXamlIsland") == 0) {
         return true;
     }
 
@@ -643,12 +764,6 @@ bool IsTrayFlyout(HWND hwnd, const RECT& taskbar, bool vertical, int middle) {
         POINT pt{GET_X_LPARAM(messagePos), GET_Y_LPARAM(messagePos)};
         return PtInRect(&taskbar, pt) &&
                (vertical ? pt.y < middle : pt.x < middle);
-    }
-
-    // Jump lists are core windows too, so the tray's are told apart by thread.
-    if (_wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0) {
-        std::wstring description = GetThreadDescriptionOf(hwnd);
-        return description == L"ActionCenter" || description == L"QuickActions";
     }
 
     return false;
@@ -684,60 +799,18 @@ BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
                               int cx,
                               int cy,
                               UINT flags) {
-    if (!(flags & SWP_NOMOVE) || (flags & SWP_SHOWWINDOW)) {
-        RECT rect{};
-        GetWindowRect(hwnd, &rect);
-        int newX = (flags & SWP_NOMOVE) ? rect.left : x;
-        int newY = (flags & SWP_NOMOVE) ? rect.top : y;
-        MirrorFlyout(hwnd, newX, newY,
-                     (flags & SWP_NOSIZE) ? rect.right - rect.left : cx,
-                     (flags & SWP_NOSIZE) ? rect.bottom - rect.top : cy);
-        if (!(flags & SWP_NOMOVE) || newX != rect.left || newY != rect.top) {
-            x = newX;
-            y = newY;
-            flags &= ~SWP_NOMOVE;
+    if (!(flags & SWP_NOMOVE)) {
+        int width = cx;
+        int height = cy;
+        if (flags & SWP_NOSIZE) {
+            RECT rect{};
+            GetWindowRect(hwnd, &rect);
+            width = rect.right - rect.left;
+            height = rect.bottom - rect.top;
         }
+        MirrorFlyout(hwnd, x, y, width, height);
     }
     return SetWindowPos_Original(hwnd, insertAfter, x, y, cx, cy, flags);
-}
-
-// For flyouts positioned earlier and only being shown now.
-void MirrorCurrentPos(HWND hwnd) {
-    RECT rect;
-    if (!GetWindowRect(hwnd, &rect)) {
-        return;
-    }
-
-    int x = rect.left;
-    int y = rect.top;
-    MirrorFlyout(hwnd, x, y, rect.right - rect.left, rect.bottom - rect.top);
-    if (x != rect.left || y != rect.top) {
-        SetWindowPos_Original(hwnd, nullptr, x, y, 0, 0,
-                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-}
-
-using ShowWindow_t = decltype(&ShowWindow);
-ShowWindow_t ShowWindow_Original;
-BOOL WINAPI ShowWindow_Hook(HWND hwnd, int cmdShow) {
-    if (cmdShow != SW_HIDE) {
-        MirrorCurrentPos(hwnd);
-    }
-    return ShowWindow_Original(hwnd, cmdShow);
-}
-
-// Shell flyouts are kept alive and hidden by cloaking.
-using DwmSetWindowAttribute_t = decltype(&DwmSetWindowAttribute);
-DwmSetWindowAttribute_t DwmSetWindowAttribute_Original;
-HRESULT WINAPI DwmSetWindowAttribute_Hook(HWND hwnd,
-                                          DWORD attribute,
-                                          LPCVOID value,
-                                          DWORD size) {
-    if (attribute == DWMWA_CLOAK && size == sizeof(BOOL) && value &&
-        !*static_cast<const BOOL*>(value)) {
-        MirrorCurrentPos(hwnd);
-    }
-    return DwmSetWindowAttribute_Original(hwnd, attribute, value, size);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -993,6 +1066,48 @@ HRESULT WINAPI RoGetActivationFactory_Hook(HSTRING classId,
 }  // namespace StartMenu
 
 ////////////////////////////////////////////////////////////////////////////////
+// Quick settings live in ShellHost.exe, the notification center in
+// ShellExperienceHost.exe. Connecting to their XAML is what lets the panel be
+// moved; creating an island is the moment their XAML runtime is ready.
+
+using ShellRoGetActivationFactory_t = decltype(&RoGetActivationFactory);
+ShellRoGetActivationFactory_t ShellRoGetActivationFactory_Original;
+HRESULT WINAPI ShellRoGetActivationFactory_Hook(HSTRING classId,
+                                               REFIID iid,
+                                               void** factory) {
+    thread_local bool inHook;
+    if (!inHook && classId) {
+        inHook = true;
+        if (wcscmp(WindowsGetStringRawBuffer(classId, nullptr),
+                   L"Windows.UI.Xaml.Hosting.XamlIsland") == 0) {
+            InjectWindhawkTAP();
+        }
+        inHook = false;
+    }
+    return ShellRoGetActivationFactory_Original(classId, iid, factory);
+}
+
+HWND FindShellWindow() {
+    HWND found = nullptr;
+    EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            DWORD processId = 0;
+            WCHAR className[64];
+            if (GetWindowThreadProcessId(hwnd, &processId) &&
+                processId == GetCurrentProcessId() &&
+                GetClassName(hwnd, className, ARRAYSIZE(className)) &&
+                (_wcsicmp(className, L"ControlCenterWindow") == 0 ||
+                 _wcsicmp(className, L"Windows.UI.Core.CoreWindow") == 0)) {
+                *reinterpret_cast<HWND*>(param) = hwnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&found));
+    return found;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Entry points.
 
 using RunFromWindowThreadProc_t = void (*)(PVOID);
@@ -1039,9 +1154,6 @@ void RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc_t proc) {
     }
 }
 
-enum class Target { explorer, startMenu, shell };
-Target g_target;
-
 BOOL Wh_ModInit() {
     WCHAR path[MAX_PATH]{};
     GetModuleFileName(nullptr, path, ARRAYSIZE(path));
@@ -1062,28 +1174,29 @@ BOOL Wh_ModInit() {
         return TRUE;
     }
 
-    WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
-                                   &SetWindowPos_Original);
-    WindhawkUtils::SetFunctionHook(ShowWindow, ShowWindow_Hook,
-                                   &ShowWindow_Original);
-    HMODULE dwmapi =
-        LoadLibraryEx(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    WindhawkUtils::SetFunctionHook(
-        (DwmSetWindowAttribute_t)GetProcAddress(dwmapi,
-                                                "DwmSetWindowAttribute"),
-        DwmSetWindowAttribute_Hook, &DwmSetWindowAttribute_Original);
-
     if (g_target == Target::explorer) {
+        WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
+                                       &SetWindowPos_Original);
         WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
                                        &CreateWindowExW_Original);
-        HMODULE kernelBase = GetModuleHandle(L"kernelbase.dll");
-        WindhawkUtils::SetFunctionHook(
-            (RegOpenKeyExW_t)GetProcAddress(kernelBase, "RegOpenKeyExW"),
-            RegOpenKeyExW_Hook, &RegOpenKeyExW_Original);
-        WindhawkUtils::SetFunctionHook(
-            (RegQueryValueExW_t)GetProcAddress(kernelBase, "RegQueryValueExW"),
-            RegQueryValueExW_Hook, &RegQueryValueExW_Original);
+    } else if (HMODULE winrt =
+                   GetModuleHandle(L"api-ms-win-core-winrt-l1-1-0.dll")) {
+        if (auto roGetActivationFactory =
+                (ShellRoGetActivationFactory_t)GetProcAddress(
+                    winrt, "RoGetActivationFactory")) {
+            WindhawkUtils::SetFunctionHook(
+                roGetActivationFactory, ShellRoGetActivationFactory_Hook,
+                &ShellRoGetActivationFactory_Original);
+        }
     }
+
+    HMODULE kernelBase = GetModuleHandle(L"kernelbase.dll");
+    WindhawkUtils::SetFunctionHook(
+        (RegOpenKeyExW_t)GetProcAddress(kernelBase, "RegOpenKeyExW"),
+        RegOpenKeyExW_Hook, &RegOpenKeyExW_Original);
+    WindhawkUtils::SetFunctionHook(
+        (RegQueryValueExW_t)GetProcAddress(kernelBase, "RegQueryValueExW"),
+        RegQueryValueExW_Hook, &RegQueryValueExW_Original);
 
     return TRUE;
 }
@@ -1093,7 +1206,11 @@ void Wh_ModAfterInit() {
         if (HWND coreWindow = StartMenu::FindCoreWindow()) {
             RunFromWindowThread(coreWindow, [](PVOID) { StartMenu::Init(); });
         }
-    } else if (g_target == Target::explorer && FindTaskbarXamlHost()) {
+    } else if (g_target == Target::explorer) {
+        if (FindTaskbarXamlHost()) {
+            InjectWindhawkTAP();
+        }
+    } else {
         InjectWindhawkTAP();
     }
 }
@@ -1113,6 +1230,14 @@ void Wh_ModUninit() {
         }
         if (HWND host = FindTaskbarXamlHost()) {
             RunFromWindowThread(host, [](PVOID) { RestoreTaskbar(); });
+        }
+    } else if (g_target == Target::shell) {
+        if (g_visualTreeWatcher) {
+            g_visualTreeWatcher->Unadvise();
+            g_visualTreeWatcher = nullptr;
+        }
+        if (HWND window = FindShellWindow()) {
+            RunFromWindowThread(window, [](PVOID) { RestorePins(); });
         }
     }
 }
