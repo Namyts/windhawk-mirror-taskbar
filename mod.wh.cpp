@@ -2,7 +2,7 @@
 // @id              taskbar-mirrored-layout
 // @name            Mirrored Taskbar Layout
 // @description     Reverses the taskbar order: on a left/right taskbar Start goes to the bottom, apps stack upwards from it, and the clock goes to the top
-// @version         3.1
+// @version         3.2
 // @author          namyts
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
@@ -36,7 +36,6 @@ matching side.
 #include <xamlom.h>
 
 #include <atomic>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -801,10 +800,10 @@ BOOL WINAPI SetWindowPos_Hook(HWND hwnd,
 // Start menu (StartMenuExperienceHost.exe).
 //
 // The Start menu window covers the whole monitor and the menu is placed inside
-// it with XAML, so the menu's placement is mirrored there. Windows sets it again
-// whenever the menu opens, so it's mirrored again whenever it changes. The
-// value last set here tells the two apart, and since mirroring twice gives the
-// original back, restoring is mirroring once more.
+// it with XAML. Windows anchors it to the Start button's end of the taskbar
+// (the top, here), so the menu is anchored to the other end instead. The
+// position is set outright, which makes it safe to apply again when the mod is
+// reloaded: a menu already at the bottom stays there.
 
 namespace StartMenu {
 
@@ -813,11 +812,6 @@ namespace StartMenu {
 struct State {
     winrt::weak_ref<wux::FrameworkElement> element;
     bool vertical = false;
-    std::optional<wux::VerticalAlignment> verticalAlignment;
-    std::optional<wux::HorizontalAlignment> horizontalAlignment;
-    std::optional<wux::Thickness> margin;
-    std::optional<double> canvasTop;
-    std::optional<double> canvasLeft;
     std::vector<std::pair<wux::DependencyProperty, int64_t>> watchTokens;
 };
 
@@ -825,93 +819,54 @@ State g_state;
 winrt::event_token g_visibilityChangedToken;
 bool g_applying;
 
-template <typename T, typename Mirror>
-void MirrorProperty(const wux::FrameworkElement& element,
-                    const wux::DependencyProperty& property,
-                    std::optional<T>& lastSet,
-                    Mirror mirror) {
-    T current = winrt::unbox_value<T>(element.GetValue(property));
-    if (lastSet && current == *lastSet) {
-        return;
-    }
-    lastSet = mirror(current);
-    element.SetValue(property, winrt::box_value(*lastSet));
-}
-
-template <typename T, typename Mirror>
-void UnmirrorProperty(const wux::FrameworkElement& element,
-                      const wux::DependencyProperty& property,
-                      std::optional<T>& lastSet,
-                      Mirror mirror) {
-    if (lastSet &&
-        winrt::unbox_value<T>(element.GetValue(property)) == *lastSet) {
-        element.SetValue(property, winrt::box_value(mirror(*lastSet)));
-    }
-    lastSet.reset();
-}
-
-wux::VerticalAlignment MirrorAlignment(wux::VerticalAlignment a) {
-    return a == wux::VerticalAlignment::Top      ? wux::VerticalAlignment::Bottom
-           : a == wux::VerticalAlignment::Bottom ? wux::VerticalAlignment::Top
-                                                 : a;
-}
-
-wux::HorizontalAlignment MirrorAlignment(wux::HorizontalAlignment a) {
-    return a == wux::HorizontalAlignment::Left    ? wux::HorizontalAlignment::Right
-           : a == wux::HorizontalAlignment::Right ? wux::HorizontalAlignment::Left
-                                                  : a;
-}
-
-// Applies (or with undo, reverts) the mirroring of every property along the
-// given axis.
-void MirrorAll(const wux::FrameworkElement& element, bool vertical, bool undo) {
+// Puts the menu at the far end of the taskbar, or back at Windows' end when
+// undoing. Both are absolute, so repeating either one changes nothing.
+void Place(const wux::FrameworkElement& element, bool vertical, bool undo) {
     auto content = GetParent(element).try_as<wux::FrameworkElement>();
-    double contentHeight = content ? content.ActualHeight() : 0;
-    double contentWidth = content ? content.ActualWidth() : 0;
-
-    auto apply = [&](const wux::DependencyProperty& property, auto& lastSet,
-                     auto mirror) {
-        if (undo) {
-            UnmirrorProperty(element, property, lastSet, mirror);
-        } else {
-            MirrorProperty(element, property, lastSet, mirror);
-        }
-    };
-
-    auto& s = g_state;
     if (content && content.try_as<wux::Controls::Canvas>()) {
-        if (vertical) {
-            apply(wux::Controls::Canvas::TopProperty(), s.canvasTop,
-                  [&](double top) {
-                      return contentHeight - element.ActualHeight() - top;
-                  });
-        } else {
-            apply(wux::Controls::Canvas::LeftProperty(), s.canvasLeft,
-                  [&](double left) {
-                      return contentWidth - element.ActualWidth() - left;
-                  });
+        double span = vertical ? content.ActualHeight() : content.ActualWidth();
+        double size = vertical ? element.ActualHeight() : element.ActualWidth();
+        if (span <= 0 || size <= 0) {
+            return;
+        }
+
+        double current = vertical ? wux::Controls::Canvas::GetTop(element)
+                                  : wux::Controls::Canvas::GetLeft(element);
+        double mirrored = span - size - current;
+        double desired = undo ? (current < mirrored ? current : mirrored)
+                              : (current > mirrored ? current : mirrored);
+        if (current != desired) {
+            vertical ? wux::Controls::Canvas::SetTop(element, desired)
+                     : wux::Controls::Canvas::SetLeft(element, desired);
         }
         return;
     }
 
+    auto margin = element.Margin();
     if (vertical) {
-        apply(wux::FrameworkElement::VerticalAlignmentProperty(),
-              s.verticalAlignment,
-              [](wux::VerticalAlignment a) { return MirrorAlignment(a); });
+        double gap = margin.Top + margin.Bottom;
+        margin.Top = undo ? 0 : gap;
+        margin.Bottom = undo ? gap : 0;
+        auto alignment = undo ? wux::VerticalAlignment::Top
+                              : wux::VerticalAlignment::Bottom;
+        if (element.VerticalAlignment() != alignment) {
+            element.VerticalAlignment(alignment);
+        }
     } else {
-        apply(wux::FrameworkElement::HorizontalAlignmentProperty(),
-              s.horizontalAlignment,
-              [](wux::HorizontalAlignment a) { return MirrorAlignment(a); });
+        double gap = margin.Left + margin.Right;
+        margin.Left = undo ? 0 : gap;
+        margin.Right = undo ? gap : 0;
+        auto alignment = undo ? wux::HorizontalAlignment::Left
+                              : wux::HorizontalAlignment::Right;
+        if (element.HorizontalAlignment() != alignment) {
+            element.HorizontalAlignment(alignment);
+        }
     }
-    apply(wux::FrameworkElement::MarginProperty(), s.margin,
-          [vertical](wux::Thickness t) {
-              if (vertical) {
-                  std::swap(t.Top, t.Bottom);
-              } else {
-                  std::swap(t.Left, t.Right);
-              }
-              return t;
-          });
+    auto current = element.Margin();
+    if (current.Left != margin.Left || current.Top != margin.Top ||
+        current.Right != margin.Right || current.Bottom != margin.Bottom) {
+        element.Margin(margin);
+    }
 }
 
 void Apply();
@@ -936,7 +891,7 @@ void Watch(const wux::FrameworkElement& element) {
 void Restore() {
     auto element = g_state.element.get();
     if (element) {
-        MirrorAll(element, g_state.vertical, /*undo=*/true);
+        Place(element, g_state.vertical, /*undo=*/true);
         for (const auto& [property, token] : g_state.watchTokens) {
             element.UnregisterPropertyChangedCallback(property, token);
         }
@@ -945,6 +900,10 @@ void Restore() {
 }
 
 void Apply() try {
+    if (g_unloading) {
+        return;
+    }
+
     auto window = wux::Window::Current();
     auto content = window ? window.Content() : nullptr;
     if (!content) {
@@ -969,7 +928,7 @@ void Apply() try {
         g_state.vertical = vertical;
         Watch(element);
     }
-    MirrorAll(element, vertical, /*undo=*/false);
+    Place(element, vertical, /*undo=*/false);
 
     g_applying = false;
 } catch (...) {
@@ -977,9 +936,13 @@ void Apply() try {
     Wh_Log(L"Error %08X", winrt::to_hresult());
 }
 
+bool Ready() {
+    return g_visibilityChangedToken.value != 0;
+}
+
 void Init() try {
     auto window = wux::Window::Current();
-    if (g_visibilityChangedToken || !window) {
+    if (g_unloading || g_visibilityChangedToken || !window) {
         return;
     }
 
@@ -1185,10 +1148,33 @@ BOOL Wh_ModInit() {
     return TRUE;
 }
 
+void AttachStartMenu() {
+    if (HWND coreWindow = StartMenu::FindCoreWindow()) {
+        RunFromWindowThread(coreWindow, [](PVOID) { StartMenu::Init(); });
+    }
+}
+
+// The Start menu's window often doesn't exist yet when the mod loads, and it
+// isn't recreated just because Explorer restarted. Keep trying briefly so
+// enabling the mod updates the menu that's already running.
+DWORD WINAPI StartMenuAttachThread(LPVOID) {
+    for (int i = 0; i < 50 && !g_unloading && !StartMenu::Ready(); i++) {
+        AttachStartMenu();
+        Sleep(100);
+    }
+    return 0;
+}
+
 void Wh_ModAfterInit() {
     if (g_target == Target::startMenu) {
-        if (HWND coreWindow = StartMenu::FindCoreWindow()) {
-            RunFromWindowThread(coreWindow, [](PVOID) { StartMenu::Init(); });
+        AttachStartMenu();
+        if (!StartMenu::Ready()) {
+            HANDLE thread =
+                CreateThread(nullptr, 0, StartMenuAttachThread, nullptr, 0,
+                             nullptr);
+            if (thread) {
+                CloseHandle(thread);
+            }
         }
     } else if (g_target == Target::explorer) {
         if (FindTaskbarXamlHost()) {
